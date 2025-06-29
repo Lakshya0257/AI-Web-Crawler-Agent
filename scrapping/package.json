@@ -1,0 +1,40 @@
+{
+  "name": "intelligent-web-scraper-ts",
+  "version": "1.0.0",
+  "description": "TypeScript-based Intelligent Web Scraper with LLM-driven exploration",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "start": "tsx src/index.ts",
+    "dev": "tsx watch src/index.ts",
+    "test": "tsx src/index.ts",
+    "test-tools": "tsx test-all-clients.ts",
+    "socket": "tsx src/socket-server.ts",
+    "socket:dev": "tsx watch src/socket-server.ts"
+  },
+  "dependencies": {
+    "@ai-sdk/anthropic": "^1.0.6",
+    "@ai-sdk/google-vertex": "^2.0.6",
+    "@ai-sdk/openai": "^1.0.14",
+    "@anthropic-ai/sdk": "^0.28.0",
+    "@browserbasehq/stagehand": "^2.3.1",
+    "@types/socket.io": "^3.0.1",
+    "ai": "^4.0.32",
+    "crypto": "^1.0.1",
+    "dotenv": "^16.0.3",
+    "openai": "^4.80.0",
+    "playwright": "^1.49.1",
+    "sharp": "^0.33.5",
+    "socket.io": "^4.8.1",
+    "typescript": "^5.0.0",
+    "uuid": "^9.0.0",
+    "winston": "^3.15.0",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.7",
+    "@types/sharp": "^0.31.1",
+    "@types/uuid": "^9.0.0",
+    "tsx": "^4.0.0"
+  }
+}
