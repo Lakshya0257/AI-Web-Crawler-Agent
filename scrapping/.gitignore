@@ -9,3 +9,7 @@
 
 creds.json
 .env
+
+/dist/
+
+/downloads/

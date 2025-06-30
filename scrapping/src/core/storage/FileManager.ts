@@ -1,9 +1,9 @@
 import fs from "fs";
 import path from "path";
 import crypto from "crypto";
-import { SessionMetadata, PageData } from "../types/exploration.js";
+import { SessionMetadata, PageData } from "../../types/exploration.js";
 import type { Socket } from "socket.io";
-import logger from "../utils/logger.js";
+import logger from "../../utils/logger.js";
 
 export class FileManager {
   private baseDir: string;

@@ -1,7 +1,7 @@
 import Anthropic from "@anthropic-ai/sdk";
 import sharp from "sharp";
-import logger from "../utils/logger.js";
-import { FileManager } from "./FileManager.js";
+import logger from "../../utils/logger.js";
+import { FileManager } from "../storage/FileManager.js";
 import {
   LLMDecisionResponse,
   PageObserveResponse,
@@ -10,7 +10,7 @@ import {
   UserInputResponse,
   PageData,
   ActionHistoryEntry,
-} from "../types/exploration.js";
+} from "../../types/exploration.js";
 
 export class LLMClient {
   private anthropic: Anthropic;
@@ -546,6 +546,8 @@ Decide what tool to use next and provide the exact parameters. Think step by ste
 Remember: Break down complex actions into simple steps. One action per step.`;
 
       conversationHistory.push({ role: "user", content: contextPrompt });
+
+      console.log(systemPrompt);
 
       const response = await this.anthropic.messages.create({
         model: "claude-3-5-sonnet-20241022",

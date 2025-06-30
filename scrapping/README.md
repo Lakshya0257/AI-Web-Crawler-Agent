@@ -1,240 +1,165 @@
-# 🤖 Intelligent Web Scraper (TypeScript)
+# Intelligent Web Scraper - TypeScript
 
-**Autonomous Website Exploration with Detailed Logging & Multiple Screenshots**
+AI-driven web exploration and scraping tool with real-time frontend dashboard.
 
-## ✨ Features
+## 🏗️ Project Structure
 
-- **🧠 Intelligent Exploration**: Step-by-step autonomous website navigation
-- **📸 Multiple Screenshots**: Captures screenshots at every action step
-- **📝 Detailed Logging**: Creates individual log files for each step + master log
-- **🔄 Dynamic Interaction**: Clicks links, navigates pages, extracts data
-- **📊 Structured Data**: Exports comprehensive JSON results
-- **🎯 Goal-Oriented**: Follows a systematic exploration pattern
+```
+scrapping/
+├── src/                          # Source code
+│   ├── core/                     # Core business logic
+│   │   ├── exploration/          # Web exploration functionality
+│   │   │   ├── WebExplorer.ts    # Main exploration engine
+│   │   │   └── index.ts          # Export module
+│   │   ├── llm/                  # LLM clients and interfaces
+│   │   │   ├── LLMClient.ts      # Claude LLM client
+│   │   │   ├── GlobalStagehandClient.ts # Stagehand LLM adapter
+│   │   │   └── index.ts          # Export module
+│   │   ├── storage/              # Data persistence and file management
+│   │   │   ├── FileManager.ts    # File system operations
+│   │   │   └── index.ts          # Export module
+│   │   └── index.ts              # Core module exports
+│   ├── server/                   # Server-related code
+│   │   ├── SocketServer.ts       # Socket.IO server implementation
+│   │   └── index.ts              # Export module
+│   ├── interfaces/               # TypeScript interfaces
+│   │   ├── IExplorer.ts          # Explorer interface
+│   │   ├── ILLMClient.ts         # LLM client interface
+│   │   └── index.ts              # Export module
+│   ├── types/                    # Type definitions
+│   │   └── exploration.ts        # Core exploration types
+│   ├── utils/                    # Utility functions
+│   │   └── logger.ts             # Winston logging configuration
+│   ├── index.ts                  # Main entry point + exports
+│   └── socket-server.ts          # Socket server entry point
+├── tests/                        # Test files
+│   ├── test-all-clients.ts       # Multi-provider LLM tests
+│   ├── test-individual-tools.ts  # Individual tool tests
+│   ├── test-gemini.ts            # Gemini-specific tests
+│   ├── OpenAIStagehandClient.ts  # OpenAI client (testing only)
+│   └── GoogleVertexStagehandClient.ts # Vertex client (testing only)
+├── docs/                         # Documentation
+│   ├── README.md                 # Main documentation
+│   ├── QUICK_START.md            # Quick start guide
+│   ├── SOCKET_IO_API.md          # Socket.IO API documentation
+│   ├── USER_INPUT_MODULE.md      # User input system docs
+│   ├── BACKGROUND_PROCESSING.md  # Background processing guide
+│   ├── TOOL_TESTER_README.md     # Tool testing guide
+│   ├── DEMO_README.md            # Demo instructions
+│   └── FOLDER_STRUCTURE.md       # Previous structure docs
+├── config/                       # Configuration files
+│   ├── tsconfig.json             # TypeScript configuration
+│   └── tailwind.config.js        # Tailwind CSS config
+├── scripts/                      # Build and deployment scripts
+├── dist/                         # Compiled output (auto-generated)
+├── logs/                         # Log files
+├── downloads/                    # Downloaded files
+├── package.json                  # Dependencies and scripts
+├── tsconfig.json                 # TS config (extends config/tsconfig.json)
+└── .gitignore                    # Git ignore rules
+```
 
 ## 🚀 Quick Start
 
-### Prerequisites
-- Node.js 18+
-- **Google Gemini API key** (required for LLM automation)
-
 ### Installation
-
 ```bash
-# Install dependencies
 npm install
-
-# Setup environment
-cp .env.example .env
-# Edit .env with your Google API key
 ```
 
-### Usage
-
+### Build
 ```bash
-# Run the scraper
-npm test
-
-# Or with dev mode (auto-reload)
-npm run dev
-```
-
-## 🎯 How It Works
-
-### Exploration Flow
-The scraper follows this exact pattern:
-
-1. **🌐 Initialize Browser** - Set up Stagehand automation
-2. **🔗 Navigate** - Go to target URL + take screenshot
-3. **👀 Observe** - Analyze page structure and navigation
-4. **📊 Extract** - Get basic page information and content
-5. **🔄 Interact** - Click navigation links (About/Services)
-6. **📸 Screenshot** - Capture multiple page views
-7. **📊 Secondary Extract** - Get information from new page
-8. **🔙 Navigate Back** - Return to home page
-9. **📊 Final Extract** - Comprehensive data extraction
-
-### Screenshots Captured
-- **Navigation screenshots** - After each page navigation
-- **Action result screenshots** - After clicking/interacting
-- **Full page screenshots** - Complete page capture
-- **Viewport screenshots** - Above-the-fold content
-- **Multiple per step** - Different views of same action
-
-### Log Files Created
-```
-analysis/
-└── domain_name_timestamp/
-    ├── step_01_initialize.json
-    ├── step_02_browser_init.json
-    ├── step_03_navigate.json
-    ├── step_04_page_observe.json
-    ├── step_05_page_extract.json
-    ├── step_06_page_act.json
-    ├── step_07_take_screenshot.json
-    ├── step_08_page_extract.json
-    ├── step_09_page_act.json
-    ├── step_10_page_extract.json
-    ├── master_log.json
-    ├── session_metadata.json
-    └── complete_session_log.json
-```
-
-## 📊 Data Structure
-
-```typescript
-interface ScrapingResult {
-  success: boolean;
-  url: string;
-  totalSteps: number;
-  explorationSteps: ExplorationStep[];
-  screenshots: Screenshot[];
-  extractedData: {
-    observations: any[];
-    extractions: any[];
-    actions: any[];
-    pageInfo: any;
-  };
-  processingTime: number;
-  timestamp: string;
-  sessionId: string;
-}
-```
-
-### Example Output
-```json
-{
-  "success": true,
-  "url": "https://profit.co",
-  "totalSteps": 7,
-  "explorationSteps": [
-    {
-      "step": 1,
-      "action": { "action": "page_observe", "instruction": "Analyze page structure" },
-      "success": true,
-      "data": { "observation": {...}, "pageUrl": "..." },
-      "screenshots": []
-    }
-  ],
-  "screenshots": [
-    {
-      "filename": "step_02_navigate_2025-06-25T10-30-45-123Z.png",
-      "path": "screenshots/domain_timestamp/...",
-      "step": 2,
-      "action": "navigate",
-      "timestamp": "2025-06-25T10:30:45.123Z"
-    }
-  ],
-  "extractedData": {
-    "observations": [...],
-    "extractions": [...],
-    "actions": [...],
-    "pageInfo": {...}
-  },
-  "processingTime": 45000,
-  "sessionId": "profit_co_2025-06-25T10-30-45Z"
-}
-```
-
-## 🔧 Configuration
-
-### Change Target URL
-Edit `src/index.ts`:
-```typescript
-const testUrl = 'https://your-target-website.com';
-const objective = 'Your exploration objective here';
-```
-
-### Environment Variables
-Create `.env`:
-```bash
-GOOGLE_API_KEY=your_google_api_key_here
-```
-
-## 📁 File Structure
-
-```
-src/
-├── types/
-│   └── index.ts              # TypeScript interfaces
-├── utils/
-│   └── logger.ts            # Winston logging setup  
-├── services/
-│   ├── IntelligentScraper.ts   # Main scraper engine
-│   ├── SessionLogger.ts        # Step-by-step logging
-│   └── ScreenshotManager.ts    # Screenshot handling
-└── index.ts                 # Entry point
-
-Generated Output:
-├── analysis/                # Step-by-step logs
-├── screenshots/             # Captured images  
-├── data/                   # Final JSON results
-└── logs/                   # System logs
-```
-
-## 🎯 Action Types
-
-- **`page_observe`** - Analyze page structure, find navigation elements
-- **`page_act`** - Interact with page (click links, navigate)
-- **`page_extract`** - Extract data (titles, content, contact info)
-- **`take_screenshot`** - Capture visual state of page
-
-## 📸 Screenshot Organization
-
-Screenshots are organized by session and step:
-```
-screenshots/
-└── profit_co_2025-06-25T10-30-45Z/
-    ├── step_02_navigate_2025-06-25T10-30-45-123Z.png
-    ├── step_06_action_result_2025-06-25T10-30-47-456Z.png
-    ├── step_07_full_page_2025-06-25T10-30-48-789Z.png
-    ├── step_07_viewport_2025-06-25T10-30-49-012Z.png
-    └── screenshot_manifest.json
-```
-
-## 🔍 Example Console Output
-
-```bash
-🚀 Starting Intelligent Web Scraper
-🎯 Testing with URL: https://profit.co
-🚀 Session started: profit_co_2025-06-25T10-30-45Z
-🌐 Initializing browser...
-✅ Browser initialized successfully
-🔗 Navigating to: https://profit.co
-✅ Successfully navigated to https://profit.co
-🔄 Step 2: page_observe - Analyze the current page structure
-✅ Step 2: page_observe - Analyze the current page structure (1250ms)
-🔄 Step 3: page_extract - Extract basic page information
-✅ Step 3: page_extract - Extract basic page information (890ms)
-🔄 Step 4: page_act - Look for and click on About or Services navigation link
-✅ Step 4: page_act - Look for and click on About or Services navigation link (2100ms) | Screenshots: 1
-🔄 Step 5: take_screenshot - Capture multiple screenshots
-📸 2 screenshots saved for step 5
-✅ Step 5: take_screenshot - Capture multiple screenshots (1450ms) | Screenshots: 2
-✅ Scraping completed successfully!
-📊 Results:
-   • Total Steps: 7
-   • Screenshots: 8
-   • Processing Time: 15230ms
-   • Session ID: profit_co_2025-06-25T10-30-45Z
-```
-
-## 🛠 Development
-
-```bash
-# Build TypeScript
 npm run build
-
-# Run with auto-reload
-npm run dev
-
-# Direct execution
-npm start
 ```
 
-## 🚀 Get Started
+### Run
+```bash
+# Main exploration tool
+npm start
 
-1. **Get Google Gemini API key** from [Google AI Studio](https://makersuite.google.com/app/apikey)
-2. **Set environment variables** in `.env`
-3. **Run the scraper**: `npm test`
+# Socket.IO server for frontend dashboard
+npm run start:socket
 
-That's it! The system will autonomously explore the website and create detailed logs and screenshots of every step. 🎉
+# Development mode (with compilation)
+npm run dev
+npm run dev:socket
+```
+
+### Testing
+```bash
+# Test all LLM providers
+npm run test
+
+# Test individual tools
+npm run test:tools
+
+# Test Gemini specifically
+npm run test:gemini
+```
+
+## 🔧 Development Scripts
+
+- `npm run build` - Compile TypeScript to JavaScript
+- `npm run clean` - Remove compiled output
+- `npm run type-check` - Type check without compilation
+- `npm run lint` - Run linting (placeholder)
+- `npm run format` - Format code (placeholder)
+
+## 📦 Core Modules
+
+### `core/exploration`
+- **WebExplorer**: Main exploration engine that orchestrates web crawling and AI decision-making
+- **Features**: Page processing, tool execution, session management, objective tracking
+
+### `core/llm`  
+- **LLMClient**: Claude Anthropic integration for AI decision-making
+- **GlobalStagehandClient**: Adapter for Stagehand browser automation
+- **Features**: Decision making, page analysis, action planning, extraction formatting
+
+### `core/storage`
+- **FileManager**: File system operations and session persistence
+- **Features**: Screenshot storage, session data, conversation history, URL organization
+
+### `server`
+- **SocketServer**: Real-time communication with frontend dashboard
+- **Features**: Exploration management, user input handling, progress streaming
+
+## 🎯 Key Features
+
+- **AI-Driven Exploration**: Claude-powered decision making
+- **Real-time Dashboard**: Live progress tracking via Socket.IO
+- **User Input System**: Interactive authentication flows
+- **Standby Tool**: Loading state detection and waiting
+- **Enhanced Extraction**: Versioned data extraction with comprehensive formatting
+- **Action History**: Persistent tracking of all page interactions
+- **URL Management**: Smart queue management with hash fragment support
+- **Session Persistence**: Full exploration session recovery
+
+## 🔄 Architecture Benefits
+
+1. **Modular Design**: Clear separation of concerns
+2. **Type Safety**: Comprehensive TypeScript interfaces  
+3. **Testability**: Isolated modules with clean interfaces
+4. **Maintainability**: Logical organization and documentation
+5. **Extensibility**: Easy to add new LLM providers or tools
+6. **Clean Imports**: Barrel exports for better developer experience
+
+## 📝 Environment Variables
+
+Create a `.env` file:
+```env
+ANTHROPIC_API_KEY=your_claude_key
+BROWSERBASE_PROJECT_ID=your_browserbase_id
+BROWSERBASE_API_KEY=your_browserbase_key
+```
+
+## 🤝 Contributing
+
+1. Follow the established folder structure
+2. Add proper TypeScript types
+3. Update relevant interfaces
+4. Add tests for new functionality
+5. Update documentation
+
+## 📄 License
+
+MIT License - see LICENSE file for details. 

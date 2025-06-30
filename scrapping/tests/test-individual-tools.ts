@@ -1,6 +1,6 @@
 import "dotenv/config";
 import { Stagehand } from "@browserbasehq/stagehand";
-import { OpenAIStagehandClient } from "./src/services/OpenAIStagehandClient.js";
+import { OpenAIStagehandClient } from "./OpenAIStagehandClient.js";
 import { openai } from "@ai-sdk/openai";
 import { z } from "zod";
 import fs from 'fs';

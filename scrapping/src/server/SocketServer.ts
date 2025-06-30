@@ -3,11 +3,9 @@ import { createServer } from "http";
 import fs from "fs";
 import path from "path";
 import logger from "../utils/logger.js";
-import { WebExplorer } from "./WebExplorer.js";
-import { FileManager } from "./FileManager.js";
+import { WebExplorer, FileManager, GlobalStagehandClient } from "../core/index.js";
 import { Stagehand } from "@browserbasehq/stagehand";
 import { chromium } from "playwright";
-import { GlobalStagehandClient } from "./GlobalStagehandClient.js";
 import { anthropic } from "@ai-sdk/anthropic";
 
 interface ExecutionCommand {
@@ -152,7 +150,7 @@ export class SocketServer {
         verbose: 1,
         llmClient: openaiClient,
         localBrowserLaunchOptions: {
-          headless: false,
+          headless: true,
         },
         browserbaseSessionCreateParams: {
           projectId: process.env.BROWSERBASE_PROJECT_ID!,

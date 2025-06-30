@@ -1,11 +1,11 @@
 import "dotenv/config";
 import { Stagehand } from "@browserbasehq/stagehand";
-import { OpenAIStagehandClient } from "./src/services/OpenAIStagehandClient.js";
-import { GoogleVertexStagehandClient } from "./src/services/GoogleVertexStagehandClient.js";
+import { OpenAIStagehandClient } from "./OpenAIStagehandClient.js";
+import { GoogleVertexStagehandClient } from "./GoogleVertexStagehandClient.js";
 import { openai } from "@ai-sdk/openai";
 import { anthropic } from "@ai-sdk/anthropic";
 import { vertex } from "@ai-sdk/google-vertex";
-import { GlobalStagehandClient } from "./src/services/GlobalStagehandClient.js";
+import { GlobalStagehandClient } from "../src/core/llm/GlobalStagehandClient.js";
 
 async function testStagehandClients() {
   console.log("🧪 Testing All Stagehand Clients");

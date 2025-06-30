@@ -1,9 +1,15 @@
 import "dotenv/config";
 import { Stagehand } from "@browserbasehq/stagehand";
-import { WebExplorer } from "./services/WebExplorer.js";
+import { WebExplorer, GlobalStagehandClient } from "./core/index.js";
 import logger from "./utils/logger.js";
 import { anthropic } from "@ai-sdk/anthropic";
-import { GlobalStagehandClient } from "./services/GlobalStagehandClient.js";
+
+// Re-export all modules for external use
+export * from "./core/index.js";
+export * from "./server/index.js";
+export * from "./interfaces/index.js";
+export * from "./types/exploration.js";
+export * from "./utils/logger.js";
 
 async function main() {
   logger.info("🚀 Starting Fresh Web Explorer");

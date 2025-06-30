@@ -3,9 +3,9 @@ import { Stagehand } from "@browserbasehq/stagehand";
 import { z } from "zod";
 import fs from "fs";
 import path from "path";
-import logger from "../utils/logger.js";
-import { FileManager } from "./FileManager.js";
-import { LLMClient } from "./LLMClient.js";
+import logger from "../../utils/logger.js";
+import { FileManager } from "../storage/FileManager.js";
+import { LLMClient } from "../llm/LLMClient.js";
 import {
   ExplorationSession,
   SessionMetadata,
@@ -15,7 +15,7 @@ import {
   FlowContext,
   ExtractionResult,
   PageScreenshot,
-} from "../types/exploration.js";
+} from "../../types/exploration.js";
 import type { Socket } from "socket.io";
 
 export class WebExplorer {
