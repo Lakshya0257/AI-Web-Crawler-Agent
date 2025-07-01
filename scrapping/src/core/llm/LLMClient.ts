@@ -1,7 +1,15 @@
-import Anthropic from "@anthropic-ai/sdk";
+import { generateText, generateObject, LanguageModel } from "ai";
+import { vertex } from "@ai-sdk/google-vertex";
+import { anthropic } from "@ai-sdk/anthropic";
 import sharp from "sharp";
+import { z } from "zod";
 import logger from "../../utils/logger.js";
 import { FileManager } from "../storage/FileManager.js";
+import {
+  GlobalStore,
+  PageStore,
+  InteractionGraph,
+} from "../storage/GlobalStore.js";
 import {
   LLMDecisionResponse,
   PageObserveResponse,
@@ -13,7 +21,8 @@ import {
 } from "../../types/exploration.js";
 
 export class LLMClient {
-  private anthropic: Anthropic;
+  private model: LanguageModel;
+  private claudeModel: LanguageModel;
   private additionalContext?: string;
   private canLogin: boolean;
 
@@ -22,11 +31,15 @@ export class LLMClient {
     additionalContext?: string,
     canLogin: boolean = false
   ) {
-    const apiKey = process.env.ANTHROPIC_API_KEY;
-    if (!apiKey) {
-      throw new Error("ANTHROPIC_API_KEY environment variable not found");
-    }
-    this.anthropic = new Anthropic({ apiKey });
+    // Check for required environment variables (These are automatically used by the SDK)
+    // Vertex AI authentication should be set up via Application Default Credentials
+
+    // Initialize Vertex AI model (Gemini)
+    this.model = vertex("gemini-1.5-pro");
+
+    // Initialize Claude model for graph generation
+    this.claudeModel = anthropic("claude-3-5-sonnet-20241022");
+
     this.additionalContext = additionalContext;
     this.canLogin = canLogin;
   }
@@ -182,28 +195,35 @@ ${
     ? `
 EXPLORATION MODE ACTIVATED:
 Since this is an exploration objective, your strategy should be:
-1. FIRST: Extract all important content, links, and navigation from the CURRENT page
-2. THEN: Click on links ONE BY ONE in separate decisions to register new pages for future processing (Priority before exploring the current page, there can be sidebar/leftpanel buttons etc which may lead to new pages)
-3. Do NOT try to extract content from pages you're clicking to - they will be processed separately
-4. Focus on discovering and registering as many relevant pages as possible
-5. Keep page_act instructions simple: just "Click the [element name]" - nothing more
+1. EXPLORE THE CURRENT PAGE COMPLETELY: Click ALL visible buttons, filters, dropdowns, toggles, tabs, and interactive elements
+2. THOROUGH INTERACTION: Don't assume what elements do - actually interact with them to see their behavior
+3. FOCUS ON SCREENSHOT: Base decisions strictly on what you can see in the screenshot, don't assume functionality
+4. SEQUENTIAL EXPLORATION: Explore one element at a time, observing the changes after each interaction
+5. DISCOVER NEW PAGES: Click on links that lead to new pages to register them for future processing
 
 For exploration:
-- Use page_extract FIRST to capture all important content about the product etc from the current page
-- Then use page_act to click individual links to discover new pages
-- Each page_act should be simple: "Click the 'About' link" (not "Click About and extract all content")
-- Let the system process discovered pages separately later
+- Click every button, filter, dropdown, tab, toggle, and interactive element you can see
+- Observe how each interaction changes the page state
+- Don't assume functionality - test it by interacting
 - Scroll the page as needed to reveal more content/links
+- If you see forms, try interacting with form elements (but get confirmation before submitting)
+- Example: If you see a dropdown, click it to see what options are available
 `
     : `
 TASK-FOCUSED MODE:
 Since this is a specific task objective, your strategy should be:
-1. Navigate efficiently towards the goal
-2. Extract specific information when you find it
-3. Use page_act to reach target pages
-4. Use page_extract when you find relevant information
+1. EXPLORE THE CURRENT PAGE COMPLETELY: Click ALL visible buttons, filters, dropdowns, toggles, tabs, and interactive elements
+2. THOROUGH INTERACTION: Don't assume what elements do - actually interact with them to see their behavior
+3. FOCUS ON SCREENSHOT: Base decisions strictly on what you can see in the screenshot, don't assume functionality
+4. SEQUENTIAL EXPLORATION: Explore one element at a time, observing the changes after each interaction
+5. GOAL-ORIENTED: While exploring, keep the specific objective in mind and prioritize relevant elements
 
+- Click every button, filter, dropdown, tab, toggle, and interactive element you can see
+- Observe how each interaction changes the page state
+- Don't assume functionality - test it by interacting
 - Scroll the page as needed to reveal more content/links
+- If you see forms, try interacting with form elements (but get confirmation before submitting)
+- Example: If you see a dropdown, click it to see what options are available
 `
 }
 
@@ -231,10 +251,22 @@ ${previousActionContext}
 Analyze the visual elements, text, buttons, forms, and overall page state in the screenshot.
 The screenshot shows the CURRENT EXACT STATE of the webpage - base all decisions on what you see, after any page act, first see that if your next action can be done on same page or not, or what that previous page_act added a new url to the queue and you are trying to extract it
 
+🚨 CRITICAL ACTION CONFIRMATION REQUIRED:
+Before performing ANY action that could:
+- CREATE new data/content (posts, accounts, orders, etc.)
+- DELETE existing data/content
+- MODIFY existing information
+- SUBMIT forms with significant impact
+- MAKE purchases or financial transactions
+- CHANGE account settings or preferences
+
+You MUST use the user_input tool to get confirmation first!
+Example: "Do you want me to create a new account with the email address user@example.com? (yes/no)"
+
 Available tools:
-- page_act: Perform actions on the page (click, type, scroll to a section, scroll to bottom etc.) - provide instruction parameter, ❌ "Dont delete or modify any data, you can create new data if needed like creating a new query, creating new member etc, but not deleting anything or modifying any pre existing data"
-- page_extract: Extract structured information/data from the page - provide instruction parameter (dont use this tool to extract what to click on, analyze the screenshot instead what to click on, also what you are going to extract validate with the screenshot that you are on same page or not, or that page is added to the queue)  
+- page_act: Perform actions on the page (click, type, scroll to a section, scroll to bottom etc.) - provide instruction parameter
 - user_input: Request input from user (for login forms, OTP, email verification links, confirmations, etc.) - supports single or multiple inputs at once (only ask what you need or what is visible on the page)
+- standby: Wait for loading states or page changes - provide waitTimeSeconds parameter
 
 ⚡ CRITICAL: MULTIPLE INPUTS → SINGLE page_act:
 When you have collected MULTIPLE inputs (like email + password), use a SINGLE page_act to fill all fields:
@@ -304,7 +336,7 @@ Example insights from history:
 Respond with ONLY valid JSON in this exact format:
 {
   "reasoning": "Your analysis of the current page and why you chose this tool",
-  "tool_to_use": "page_extract|page_act|user_input|standby",
+  "tool_to_use": "page_act|user_input|standby",
   "tool_parameters": {
     "instruction": "Specific instruction for the chosen tool",
     
@@ -330,7 +362,6 @@ Respond with ONLY valid JSON in this exact format:
     // For standby tool - Wait for loading states
     "waitTimeSeconds": 5
   },
-  "next_plan": "What you plan to do after this step",
   "isCurrentPageExecutionCompleted": false,
   "isInSensitiveFlow": false
 }
@@ -547,33 +578,27 @@ Remember: Break down complex actions into simple steps. One action per step.`;
 
       conversationHistory.push({ role: "user", content: contextPrompt });
 
-      console.log(systemPrompt);
-
-      const response = await this.anthropic.messages.create({
-        model: "claude-3-5-sonnet-20241022",
-        max_tokens: 2000,
+      const response = await generateText({
+        model: this.model,
         system: systemPrompt,
+        maxTokens: 2000,
         messages: [
+          ...conversationHistory,
           {
             role: "user",
             content: [
               {
                 type: "image",
-                source: {
-                  type: "base64",
-                  media_type: "image/png",
-                  data: base64Image,
-                },
+                image: `data:image/png;base64,${base64Image}`,
               },
             ],
           },
-          ...conversationHistory,
         ],
       });
 
       // console.log("SYSTEM PROMPT", systemPrompt); // Debug log - uncomment if needed
 
-      const textContent = response.content.find((c) => c.type === "text")?.text;
+      const textContent = response.text;
       if (!textContent) {
         throw new Error("No text content in response");
       }
@@ -686,21 +711,17 @@ IMPORTANT ANALYSIS:
 
 Focus on objective completion analysis for: ${objective}`;
 
-      const response = await this.anthropic.messages.create({
-        model: "claude-3-5-sonnet-20241022",
-        max_tokens: 2000,
+      const response = await generateText({
+        model: this.model,
         system: systemPrompt,
+        maxTokens: 2000,
         messages: [
           {
             role: "user",
             content: [
               {
                 type: "image",
-                source: {
-                  type: "base64",
-                  media_type: "image/png",
-                  data: base64Image,
-                },
+                image: `data:image/png;base64,${base64Image}`,
               },
               {
                 type: "text",
@@ -719,7 +740,7 @@ Respond with ONLY valid JSON - no other text or formatting.`,
         ],
       });
 
-      const textContent = response.content.find((c) => c.type === "text")?.text;
+      const textContent = response.text;
       if (!textContent) {
         throw new Error("No text content in response");
       }
@@ -806,21 +827,17 @@ IMPORTANT:
 - Response must be parseable by JSON.parse()
 - Base your analysis on the tool execution result and screenshot comparison`;
 
-      const response = await this.anthropic.messages.create({
-        model: "claude-3-5-sonnet-20241022",
-        max_tokens: 4000,
+      const response = await generateText({
+        model: this.model,
         system: systemPrompt,
+        maxTokens: 4000,
         messages: [
           {
             role: "user",
             content: [
               {
                 type: "image",
-                source: {
-                  type: "base64",
-                  media_type: "image/png",
-                  data: base64Image,
-                },
+                image: `data:image/png;base64,${base64Image}`,
               },
               {
                 type: "text",
@@ -831,7 +848,7 @@ IMPORTANT:
         ],
       });
 
-      const textContent = response.content.find((c) => c.type === "text")?.text;
+      const textContent = response.text;
       if (!textContent) {
         throw new Error("No text content in response");
       }
@@ -923,11 +940,7 @@ IMPORTANT:
           const base64Image = resizedImage.toString("base64");
           return {
             type: "image" as const,
-            source: {
-              type: "base64" as const,
-              media_type: "image/png" as const,
-              data: base64Image,
-            },
+            image: `data:image/png;base64,${base64Image}`,
           };
         })
       );
@@ -1145,14 +1158,14 @@ Provide the ULTIMATE COMPREHENSIVE FINAL REPORT that preserves all previous cont
         },
       ];
 
-      const response = await this.anthropic.messages.create({
-        model: "claude-3-5-sonnet-20241022",
-        max_tokens: 8000,
+      const response = await generateText({
+        model: this.model,
         system: systemPrompt,
+        maxTokens: 8000,
         messages: messages,
       });
 
-      const textContent = response.content.find((c) => c.type === "text")?.text;
+      const textContent = response.text;
       if (!textContent) {
         throw new Error("No text content in response");
       }
@@ -1178,6 +1191,514 @@ Provide the ULTIMATE COMPREHENSIVE FINAL REPORT that preserves all previous cont
   }
 
   /**
+   * Ask Gemini if the interaction graph needs to be updated after a page_act
+   */
+  async shouldUpdateGraph(
+    globalStore: PageStore,
+    currentGraph: InteractionGraph | undefined,
+    latestAction: string,
+    latestScreenshot: string
+  ): Promise<boolean> {
+    try {
+      // Define Zod schema for graph update decision
+      const GraphUpdateDecisionSchema = z.object({
+        needsUpdate: z.boolean().describe("Whether the interaction graph needs to be updated"),
+        reasoning: z.string().describe("Brief explanation of why the graph does/doesn't need updating")
+      });
+
+      const systemPrompt = `You are analyzing whether an interaction graph needs to be updated after a page action.
+
+CURRENT ACTION: ${latestAction}
+
+GLOBAL STORE DATA:
+- URL: ${globalStore.url}
+- Initial Screenshot: Available
+- Action History: ${globalStore.actionHistory.length} previous actions
+- Previous Actions: ${globalStore.actionHistory.map((a) => a.instruction).join(", ")}
+
+CURRENT GRAPH STATUS:
+${currentGraph ? `Existing graph with ${currentGraph.nodes.length} nodes and ${currentGraph.edges.length} edges` : "No existing graph"}
+
+ANALYSIS CRITERIA:
+- Did the action reveal new interactive elements (buttons, dropdowns, modals, dialogs)?
+- Did the action change the page state significantly (new sections appeared, elements changed)?
+- Did the action create new interaction flows or pathways?
+- Are there new relationships between UI elements that should be mapped?
+
+Analyze the screenshot and determine if the graph needs updating.`;
+
+      // Build interleaved conversation history for graph update decision
+      const interleavedMessages = this.buildInterleavedConversationHistory(
+        globalStore, 
+        latestScreenshot
+      );
+
+      // Add decision instruction message
+      interleavedMessages.push({
+        role: "user",
+        content: [
+          {
+            type: "text",
+            text: `Analyze if the graph needs updating after this action: "${latestAction}"`,
+          },
+        ],
+      });
+
+      logger.info(`📸 Gemini graph update decision using interleaved history`, {
+        totalActions: globalStore.actionHistory.length,
+        totalMessages: interleavedMessages.length,
+        latestAction
+      });
+
+      const response = await generateObject({
+        model: this.model,
+        schema: GraphUpdateDecisionSchema,
+        system: systemPrompt,
+        maxTokens: 1000,
+        messages: interleavedMessages,
+      });
+
+      logger.info("🤖 Gemini graph update decision", {
+        needsUpdate: response.object.needsUpdate,
+        reasoning: response.object.reasoning,
+        action: latestAction,
+      });
+
+      return response.object.needsUpdate;
+    } catch (error) {
+      logger.error("❌ Failed to get graph update decision from Gemini", {
+        error,
+      });
+      return false; // Default to not updating if decision fails
+    }
+  }
+
+  /**
+   * Generate page navigation graph when URL changes (no Gemini confirmation needed)
+   */
+  async generatePageNavigationGraph(
+    sourcePageStore: PageStore,
+    currentGraph: InteractionGraph | undefined,
+    navigationAction: string,
+    sourceUrl: string,
+    targetUrl: string
+  ): Promise<InteractionGraph | null> {
+    try {
+      const systemPrompt = `You are an expert UI/UX analyst updating comprehensive interaction flow graphs for web pages.
+
+🚨 CRITICAL WARNING: This response will COMPLETELY REPLACE the existing graph. You MUST preserve ALL existing nodes, edges, descriptions, and summaries while adding navigation relationships.
+
+NAVIGATION DETAILS:
+- Source Page: ${sourceUrl}
+- Target Page: ${targetUrl}
+- Navigation Action: "${navigationAction}"
+
+ACTION HISTORY ON SOURCE PAGE:
+${sourcePageStore.actionHistory
+  .map(
+    (action, index) => `
+${index + 1}. "${action.instruction}" (Step ${action.stepNumber})
+   Timestamp: ${action.timestamp}
+`
+  )
+  .join("")}
+
+${
+  currentGraph
+    ? `
+🔒 EXISTING GRAPH TO PRESERVE COMPLETELY:
+- Current Nodes: ${currentGraph.nodes.length} (MUST PRESERVE ALL)
+- Current Edges: ${currentGraph.edges.length} (MUST PRESERVE ALL)
+- Description: ${currentGraph.description}
+- Page Summary: ${currentGraph.pageSummary}
+
+EXISTING NODES (PRESERVE EVERY SINGLE ONE):
+${currentGraph.nodes.map((node) => `- ${node.id}: ${node.label} (${node.type}) - ${node.description}`).join("\n")}
+
+EXISTING EDGES (PRESERVE EVERY SINGLE ONE):
+${currentGraph.edges.map((edge) => `- ${edge.from} → ${edge.to}: ${edge.action} - ${edge.description}`).join("\n")}
+
+⚠️ CRITICAL: Your response replaces everything. Include ALL existing nodes and edges above, plus navigation updates.
+`
+    : "No existing graph - create from scratch with navigation relationship."
+}
+
+NODE TYPES AVAILABLE (Use ALL relevant types):
+- **button**: Clickable buttons, submit buttons, action buttons, menu items
+- **link**: Navigation links, anchor tags, clickable text links  
+- **input**: Text fields, search boxes, form inputs, text areas
+- **dropdown**: Select dropdowns, combo boxes, option menus, filter dropdowns
+- **toggle**: Checkboxes, radio buttons, switches, toggle controls
+- **tab**: Tab controls, navigation tabs, tab panels, tab sections
+- **section**: Page sections, containers, content areas, UI regions
+- **dialog**: Modals, popups, overlay dialogs, confirmation boxes
+- **state**: Page states, dynamic content states, view states
+- **navigation_target**: External pages, destination pages from navigation
+
+MANDATORY GROUPING SYSTEM:
+1. **Every node MUST connect to something or belong to a section**
+2. **Create section nodes** for logical UI areas: header, sidebar, main_content, footer, navigation, forms, etc.
+3. **Use "belongs_to" edges** to connect elements to their parent sections
+4. **No orphaned nodes**: If a node has no direct interactions, it MUST have a "belongs_to" edge to a section
+
+EDGE TYPES AVAILABLE:
+- **click**: Button clicks, link clicks, menu selections
+- **hover**: Hover interactions, tooltip triggers
+- **type**: Text input, form filling
+- **select**: Dropdown selections, option choosing
+- **toggle**: Checkbox/radio button changes
+- **navigate**: Page navigation, URL changes
+- **reveals**: Shows/reveals content, opens dialogs
+- **triggers**: Triggers actions, starts processes
+- **changes_to**: State changes, content updates
+- **belongs_to**: Element belongs to/is contained within a section
+
+NAVIGATION UPDATE REQUIREMENTS:
+1. Add a "navigation_target" node for: ${targetUrl}
+2. Connect the navigation trigger element to the target page with "navigate" edge
+3. Preserve ALL existing nodes and edges
+4. Add meaningful descriptions for the navigation relationship
+
+RESPONSE FORMAT:
+Respond with ONLY valid JSON:
+{
+  "nodes": [
+    {
+      "id": "unique_node_id",
+      "label": "Human readable label",
+      "description": "Detailed description of what this element does/represents", 
+      "type": "button|link|input|dropdown|toggle|tab|section|dialog|state|navigation_target",
+      "position": {"x": 100, "y": 200}
+    }
+  ],
+  "edges": [
+    {
+      "from": "source_node_id",
+      "to": "target_node_id", 
+      "action": "click|hover|type|select|toggle|navigate|reveals|triggers|changes_to|belongs_to",
+      "description": "Detailed description of what this interaction does or relationship"
+    }
+  ],
+  "description": "COMPREHENSIVE interaction flow description including navigation relationships",
+  "pageSummary": "DETAILED PAGE SUMMARY: Complete description including navigation capability to ${targetUrl} and all other page functionality",
+  "lastUpdated": "${new Date().toISOString()}"
+}
+
+🔥 CRITICAL REQUIREMENTS:
+1. **PRESERVE EVERYTHING**: Include ALL existing nodes, edges, description, and pageSummary from above
+2. **USE ALL NODE TYPES**: Generate button, link, input, dropdown, toggle, tab, section, dialog, state, navigation_target nodes as appropriate
+3. **MANDATORY BELONGS_TO**: Every node must connect to something or belong to a section via "belongs_to" edge  
+4. **SECTION HIERARCHY**: Create section nodes and connect child elements appropriately
+5. **NO DATA LOSS**: Your response completely replaces the existing graph - don't lose any information
+6. **ADD NAVIGATION**: Include new navigation_target node and navigate edge for ${targetUrl}`;
+
+      // Build interleaved conversation history for navigation graph generation
+      const interleavedMessages = this.buildInterleavedConversationHistory(
+        sourcePageStore, 
+        sourcePageStore.actionHistory.length > 0 
+          ? sourcePageStore.actionHistory[sourcePageStore.actionHistory.length - 1].after_act 
+          : sourcePageStore.initialScreenshot
+      );
+
+      // Add navigation instruction message
+      interleavedMessages.push({
+        role: "user",
+        content: [
+          {
+            type: "text",
+            text: `Update the graph to include navigation to: ${targetUrl} via action: "${navigationAction}"`,
+          },
+        ],
+      });
+
+      logger.info(`📸 Claude navigation graph using interleaved history`, {
+        totalActions: sourcePageStore.actionHistory.length,
+        totalMessages: interleavedMessages.length,
+        navigationAction
+      });
+
+      const response = await generateText({
+        model: this.claudeModel,
+        system: systemPrompt,
+        maxTokens: 4000,
+        messages: interleavedMessages,
+      });
+
+      let cleanedContent = response.text.trim();
+
+      // Remove markdown formatting if present
+      const jsonMatch = cleanedContent.match(
+        /```(?:json)?\s*(\{[\s\S]*\})\s*```/
+      );
+      if (jsonMatch) {
+        cleanedContent = jsonMatch[1];
+      }
+
+      const graph = JSON.parse(cleanedContent) as InteractionGraph;
+
+      logger.info(`🔗 Claude generated page navigation graph`, {
+        sourceUrl,
+        targetUrl,
+        nodes: graph.nodes.length,
+        edges: graph.edges.length,
+        navigationAction,
+      });
+
+      return graph;
+    } catch (error) {
+      logger.error("❌ Failed to generate page navigation graph with Claude", {
+        error: error instanceof Error ? error.message : String(error),
+        sourceUrl,
+        targetUrl,
+      });
+      return null;
+    }
+  }
+
+  /**
+   * Generate interaction graph using Claude
+   */
+  async generateInteractionGraph(
+    globalStore: PageStore,
+    currentGraph: InteractionGraph | undefined
+  ): Promise<InteractionGraph | null> {
+    try {
+      const systemPrompt = `You are an expert UI/UX analyst creating comprehensive interaction flow graphs for web pages.
+
+🚨 CRITICAL WARNING: This response will COMPLETELY REPLACE the existing graph. You MUST preserve ALL existing nodes, edges, descriptions, and summaries while adding new discoveries.
+
+PAGE DATA:
+- URL: ${globalStore.url}  
+- Total Actions Performed: ${globalStore.actionHistory.length}
+
+ACTION HISTORY:
+${globalStore.actionHistory
+  .map(
+    (action, index) => `
+${index + 1}. "${action.instruction}" (Step ${action.stepNumber})
+   Timestamp: ${action.timestamp}
+`
+  )
+  .join("")}
+
+${
+  currentGraph
+    ? `
+🔒 EXISTING GRAPH TO PRESERVE COMPLETELY:
+- Current Nodes: ${currentGraph.nodes.length} (MUST PRESERVE ALL)
+- Current Edges: ${currentGraph.edges.length} (MUST PRESERVE ALL)
+- Description: ${currentGraph.description}
+- Page Summary: ${currentGraph.pageSummary}
+
+EXISTING NODES (PRESERVE EVERY SINGLE ONE):
+${currentGraph.nodes.map((node) => `- ${node.id}: ${node.label} (${node.type}) - ${node.description}`).join("\n")}
+
+EXISTING EDGES (PRESERVE EVERY SINGLE ONE):
+${currentGraph.edges.map((edge) => `- ${edge.from} → ${edge.to}: ${edge.action} - ${edge.description}`).join("\n")}
+
+⚠️ CRITICAL: Your response replaces everything. Include ALL existing nodes and edges above, plus any new discoveries.
+`
+    : "No existing graph - create from scratch."
+}
+
+NODE TYPES AVAILABLE (Use ALL relevant types based on UI elements):
+- **button**: Clickable buttons, submit buttons, action buttons, menu items
+- **link**: Navigation links, anchor tags, clickable text links  
+- **input**: Text fields, search boxes, form inputs, text areas
+- **dropdown**: Select dropdowns, combo boxes, option menus, filter dropdowns
+- **toggle**: Checkboxes, radio buttons, switches, toggle controls
+- **tab**: Tab controls, navigation tabs, tab panels, tab sections
+- **section**: Page sections, containers, content areas, UI regions
+- **dialog**: Modals, popups, overlay dialogs, confirmation boxes
+- **state**: Page states, dynamic content states, view states
+- **navigation_target**: External pages, destination pages from navigation
+
+MANDATORY GROUPING SYSTEM:
+1. **Every node MUST connect to something or belong to a section**
+2. **Create section nodes** for logical UI areas: header, sidebar, main_content, footer, navigation, forms, etc.
+3. **Use "belongs_to" edges** to connect elements to their parent sections
+4. **No orphaned nodes**: If a node has no direct interactions, it MUST have a "belongs_to" edge to a section
+
+EDGE TYPES AVAILABLE:
+- **click**: Button clicks, link clicks, menu selections
+- **hover**: Hover interactions, tooltip triggers
+- **type**: Text input, form filling
+- **select**: Dropdown selections, option choosing
+- **toggle**: Checkbox/radio button changes
+- **navigate**: Page navigation, URL changes
+- **reveals**: Shows/reveals content, opens dialogs
+- **triggers**: Triggers actions, starts processes
+- **changes_to**: State changes, content updates
+- **belongs_to**: Element belongs to/is contained within a section
+
+RESPONSE FORMAT:
+Respond with ONLY valid JSON:
+{
+  "nodes": [
+    {
+      "id": "unique_node_id",
+      "label": "Human readable label",
+      "description": "Detailed description of what this element does/represents", 
+      "type": "button|link|input|dropdown|toggle|tab|section|dialog|state|navigation_target",
+      "position": {"x": 100, "y": 200}
+    }
+  ],
+  "edges": [
+    {
+      "from": "source_node_id",
+      "to": "target_node_id", 
+      "action": "click|hover|type|select|toggle|navigate|reveals|triggers|changes_to|belongs_to",
+      "description": "Detailed description of what this interaction does or relationship"
+    }
+  ],
+  "description": "COMPREHENSIVE interaction flow description covering all page capabilities and relationships",
+  "pageSummary": "DETAILED PAGE SUMMARY: Complete description of what the user can accomplish on this page. Include all available actions, features, forms, navigation options, interactive elements, and capabilities. Be specific about what tasks can be performed, what information can be accessed, and what workflows are possible. This should serve as a complete guide for understanding the page's functionality.",
+  "lastUpdated": "${new Date().toISOString()}"
+}
+
+🔥 CRITICAL REQUIREMENTS:
+1. **PRESERVE EVERYTHING**: Include ALL existing nodes, edges, description, and pageSummary from above
+2. **USE ALL NODE TYPES**: Generate button, link, input, dropdown, toggle, tab, section, dialog, state, navigation_target nodes as appropriate
+3. **MANDATORY BELONGS_TO**: Every node must connect to something or belong to a section via "belongs_to" edge
+4. **SECTION HIERARCHY**: Create section nodes (header, main_content, sidebar, footer, etc.) and connect child elements
+5. **NO DATA LOSS**: Your response completely replaces the existing graph - don't lose any information
+6. **COMPREHENSIVE COVERAGE**: Include every interactive element discovered in the action history screenshots`;
+
+      // Build interleaved conversation history for graph generation
+      const interleavedMessages = this.buildInterleavedConversationHistory(
+        globalStore, 
+        globalStore.actionHistory.length > 0 
+          ? globalStore.actionHistory[globalStore.actionHistory.length - 1].after_act 
+          : globalStore.initialScreenshot
+      );
+
+      // Add final instruction message
+      interleavedMessages.push({
+        role: "user",
+        content: [
+          {
+            type: "text",
+            text: `Generate a comprehensive interaction graph based on all the action history and screenshots. ${currentGraph ? "Update the existing graph with new findings." : "Create a complete new graph."}`,
+          },
+        ],
+      });
+
+      logger.info(`📸 Claude graph generation using interleaved history`, {
+        totalActions: globalStore.actionHistory.length,
+        totalMessages: interleavedMessages.length
+      });
+
+      const response = await generateText({
+        model: this.claudeModel,
+        system: systemPrompt,
+        maxTokens: 4000,
+        messages: interleavedMessages,
+      });
+
+      let cleanedContent = response.text.trim();
+
+      // Remove markdown formatting if present
+      const jsonMatch = cleanedContent.match(
+        /```(?:json)?\s*(\{[\s\S]*\})\s*```/
+      );
+      if (jsonMatch) {
+        cleanedContent = jsonMatch[1];
+      }
+
+      const graph = JSON.parse(cleanedContent) as InteractionGraph;
+
+      logger.info(`📊 Claude generated interaction graph`, {
+        url: globalStore.url,
+        nodes: graph.nodes.length,
+        edges: graph.edges.length,
+        description: graph.description.substring(0, 100),
+      });
+
+      return graph;
+    } catch (error) {
+      logger.error("❌ Failed to generate interaction graph with Claude", {
+        error: error instanceof Error ? error.message : String(error),
+        url: globalStore.url,
+      });
+      return null;
+    }
+  }
+
+  /**
+   * Build interleaved conversation history with images
+   * Pattern: initial_screenshot -> action1 -> after_action1_screenshot -> action2 -> after_action2_screenshot -> ...
+   */
+  private buildInterleavedConversationHistory(
+    pageStore: PageStore,
+    currentScreenshot: string
+  ): Array<{ role: "user" | "assistant"; content: any[] }> {
+    const messages: Array<{ role: "user" | "assistant"; content: any[] }> = [];
+
+    // Start with initial screenshot
+    messages.push({
+      role: "user",
+      content: [
+        {
+          type: "image",
+          image: pageStore.initialScreenshot,
+        },
+        {
+          type: "text",
+          text: "Initial page state when exploration started.",
+        },
+      ],
+    });
+
+    // Add each action followed by its after-action screenshot
+    pageStore.actionHistory.forEach((action, index) => {
+      // Add action description
+      messages.push({
+        role: "assistant",
+        content: [
+          {
+            type: "text",
+            text: `Action ${action.stepNumber}: ${action.instruction}`,
+          },
+        ],
+      });
+
+      // Add after-action screenshot
+      messages.push({
+        role: "user",
+        content: [
+          {
+            type: "image",
+            image: action.after_act,
+          },
+          {
+            type: "text",
+            text: `Result after action ${action.stepNumber}: "${action.instruction}"`,
+          },
+        ],
+      });
+    });
+
+    // Add current screenshot as the latest state (only if there were actions)
+    if (pageStore.actionHistory.length > 0) {
+      messages.push({
+        role: "user",
+        content: [
+          {
+            type: "image",
+            image: currentScreenshot,
+          },
+          {
+            type: "text",
+            text: "Current page state (latest screenshot for decision making).",
+          },
+        ],
+      });
+    }
+
+    return messages;
+  }
+
+  /**
    * Resize image for Claude API limits
    */
   private async resizeImageForClaude(imageBuffer: Buffer): Promise<Buffer> {
@@ -1188,7 +1709,7 @@ Provide the ULTIMATE COMPREHENSIVE FINAL REPORT that preserves all previous cont
       throw new Error("Could not get image dimensions");
     }
 
-    const maxDimension = 8000;
+    const maxDimension = 3000;
     let newWidth = metadata.width;
     let newHeight = metadata.height;
 

@@ -2,13 +2,12 @@ import "dotenv/config";
 import { Stagehand } from "@browserbasehq/stagehand";
 import { WebExplorer, GlobalStagehandClient } from "./core/index.js";
 import logger from "./utils/logger.js";
-import { anthropic } from "@ai-sdk/anthropic";
+import { vertex } from "@ai-sdk/google-vertex";
 
 // Re-export all modules for external use
 export * from "./core/index.js";
 export * from "./server/index.js";
 export * from "./interfaces/index.js";
-export * from "./types/exploration.js";
 export * from "./utils/logger.js";
 
 async function main() {
@@ -35,18 +34,19 @@ async function main() {
     process.exit(1);
   }
 
-  // Note: OPENAI_API_KEY environment variable will be automatically used by @ai-sdk/openai
+  // Initialize Vertex AI model for Stagehand
+  const vertexModel = vertex("gemini-1.5-pro");
 
-  // Initialize OpenAI client for Stagehand
-  const openaiClient = new GlobalStagehandClient({
-    model: anthropic("claude-3-5-sonnet-20241022"),
+  // Initialize Stagehand client with Vertex AI
+  const llmClient = new GlobalStagehandClient({
+    model: vertexModel,
   });
 
   // Initialize Stagehand browser with OpenAI client
   const stagehand = new Stagehand({
     env: "LOCAL",
     verbose: 1,
-    llmClient: openaiClient,
+    llmClient: llmClient,
     localBrowserLaunchOptions: {
       headless: true,
     },

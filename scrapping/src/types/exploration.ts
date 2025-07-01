@@ -66,19 +66,33 @@ export interface ExecutedStep {
 // Single input request within a multi-input request
 export interface InputRequest {
   inputKey: string;
-  inputType: "text" | "email" | "password" | "url" | "otp" | "phone" | "boolean";
+  inputType:
+    | "text"
+    | "email"
+    | "password"
+    | "url"
+    | "otp"
+    | "phone"
+    | "boolean";
   inputPrompt: string;
 }
 
 // LLM Decision Response
 export interface LLMDecisionResponse {
   reasoning: string;
-  tool_to_use: "page_act" | "page_extract" | "user_input" | "standby";
+  tool_to_use: "page_act" | "user_input" | "standby";
   tool_parameters: {
     instruction: string;
     // For single input (backward compatibility)
     inputKey?: string;
-    inputType?: "text" | "email" | "password" | "url" | "otp" | "phone" | "boolean";
+    inputType?:
+      | "text"
+      | "email"
+      | "password"
+      | "url"
+      | "otp"
+      | "phone"
+      | "boolean";
     inputPrompt?: string;
     sensitive?: boolean;
     // For multiple inputs (new)
@@ -86,7 +100,6 @@ export interface LLMDecisionResponse {
     // For standby tool
     waitTimeSeconds?: number;
   };
-  next_plan: string;
   isCurrentPageExecutionCompleted: boolean;
   isInSensitiveFlow?: boolean;
 }
@@ -159,7 +172,12 @@ export interface UserInputData {
 
 export interface FlowContext {
   isInSensitiveFlow: boolean;
-  flowType?: "login" | "signup" | "verification" | "checkout" | "form_submission";
+  flowType?:
+    | "login"
+    | "signup"
+    | "verification"
+    | "checkout"
+    | "form_submission";
   startUrl?: string;
   flowStartStep?: number;
 }
@@ -184,4 +202,3 @@ export interface ExplorationSession {
   flowContext: FlowContext; // Track sensitive flows to prevent URL queuing interference
   actionHistory: ActionHistoryEntry[]; // Persistent history of all page_act instructions and their URL outcomes
 }
- 

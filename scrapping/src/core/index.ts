@@ -5,4 +5,5 @@ export * from './exploration/index.js';
 export * from './llm/index.js';
 
 // Storage and file management
-export * from './storage/index.js'; 
+export * from './storage/index.js';
+export * from './storage/GlobalStore.js'; 

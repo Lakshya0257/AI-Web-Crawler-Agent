@@ -5,7 +5,14 @@ import fs from "fs";
 import path from "path";
 import logger from "../../utils/logger.js";
 import { FileManager } from "../storage/FileManager.js";
+import { GlobalStore } from "../storage/GlobalStore.js";
 import { LLMClient } from "../llm/LLMClient.js";
+import {
+  ChatAgent,
+  ExplorationCheckpoint,
+  ChatDecision,
+  ChatMessage,
+} from "./ChatAgent.js";
 import {
   ExplorationSession,
   SessionMetadata,
@@ -21,7 +28,9 @@ import type { Socket } from "socket.io";
 export class WebExplorer {
   protected session: ExplorationSession;
   private fileManager: FileManager;
+  private globalStore: GlobalStore;
   private llmClient: LLMClient;
+  private chatAgent: ChatAgent;
   private stagehand: Stagehand;
   private sessionDecisionHistory: any[] = []; // Track all decisions made during the session
   private isExplorationObjective: boolean; // Add exploration mode detection
@@ -33,6 +42,11 @@ export class WebExplorer {
   private activeExplorations?: Map<string, WebExplorer>; // Reference to activeExplorations from SocketServer
   private additionalContext?: string;
   private canLogin: boolean;
+
+  // 🆕 Chat and Checkpoint System
+  private explorationCheckpoint?: ExplorationCheckpoint;
+  private isInterrupted: boolean = false;
+  private browserShouldStayOpen: boolean = true;
 
   constructor(
     private browser: Browser,
@@ -61,10 +75,25 @@ export class WebExplorer {
 
     const sessionId = FileManager.generateSessionId(startUrl);
     this.fileManager = new FileManager(sessionId, socket, userName);
+
+    // Initialize GlobalStore with session directory
+    const baseDir = userName ? userName : "exploration_sessions";
+    const sessionDir = path.join(baseDir, sessionId);
+    this.globalStore = new GlobalStore(sessionDir, socket, userName);
+
     this.llmClient = new LLMClient(
       this.fileManager,
       this.additionalContext,
       this.canLogin
+    );
+
+    // Initialize ChatAgent for handling user interruptions
+    this.chatAgent = new ChatAgent(
+      this.page,
+      this.globalStore,
+      this.fileManager,
+      socket,
+      userName
     );
 
     // Initialize session
@@ -113,11 +142,29 @@ export class WebExplorer {
     if (maxPagesToExplore !== undefined) {
       this.maxPagesToExplore = maxPagesToExplore;
     }
+
     try {
+      // Load any existing checkpoint
+      this.loadCheckpoint();
+
       // Add starting URL to queue
       await this.addUrlToQueue(this.session.metadata.startUrl, 1);
 
-      return await this.exploreSequentially();
+      // Start exploration (will pause for chat and resume as needed)
+      const result = await this.exploreSequentially();
+
+      // After exploration completes, keep browser open for chat
+      if (this.browserShouldStayOpen) {
+        logger.info(`🌐 Exploration completed, browser staying open for chat`, {
+          finalResult: result,
+          pagesExplored: this.session.metadata.totalPagesDiscovered,
+        });
+
+        // Don't close browser - wait for chat messages
+        // The browser lifecycle will be managed externally
+      }
+
+      return result;
     } catch (error) {
       logger.error("❌ Exploration failed", {
         error: error instanceof Error ? error.message : String(error),
@@ -132,12 +179,17 @@ export class WebExplorer {
   private async exploreSequentially(): Promise<boolean> {
     // Main exploration loop - sequential processing
     while (this.session.pageQueue.length > 0) {
-      // Check if user is still active
-      if (!this.isUserStillActive()) {
-        logger.info(
-          "🛑 Stopping sequential exploration - user no longer active"
-        );
-        return await this.finalizeSession(false);
+      // Check if exploration should continue (not interrupted by chat)
+      if (!this.shouldContinueExploration()) {
+        if (this.isInterrupted) {
+          logger.info("⏸️ Sequential exploration paused for chat");
+          return true; // Return true to indicate graceful pause, not failure
+        } else {
+          logger.info(
+            "🛑 Stopping sequential exploration - user no longer active"
+          );
+          return await this.finalizeSession(false);
+        }
       }
 
       if (this.session.metadata.objectiveAchieved) {
@@ -163,12 +215,18 @@ export class WebExplorer {
 
     // Process pages with background processing
     while (true) {
-      // Check if user is still active
-      if (!this.isUserStillActive()) {
-        logger.info(
-          "🛑 Stopping background exploration - user no longer active"
-        );
-        return await this.finalizeSession(false);
+      // Check if exploration should continue (not interrupted by chat)
+      if (!this.shouldContinueExploration()) {
+        if (this.isInterrupted) {
+          logger.info("⏸️ Background exploration paused for chat");
+          await this.waitForAllProcessingToComplete();
+          return true; // Return true to indicate graceful pause, not failure
+        } else {
+          logger.info(
+            "🛑 Stopping background exploration - user no longer active"
+          );
+          return await this.finalizeSession(false);
+        }
       }
 
       // Check if objective is achieved
@@ -255,10 +313,15 @@ export class WebExplorer {
    * Process a single page with tool-driven approach
    */
   protected async processPage(pageData: PageData): Promise<void> {
-    // Check if user is still active before processing page
-    if (!this.isUserStillActive()) {
-      logger.info(`🛑 Stopping page processing - user no longer active`);
-      return;
+    // Check if exploration should continue before processing page
+    if (!this.shouldContinueExploration()) {
+      if (this.isInterrupted) {
+        logger.info(`⏸️ Page processing paused for chat: ${pageData.url}`);
+        return; // Gracefully exit to allow chat handling
+      } else {
+        logger.info(`🛑 Stopping page processing - user no longer active`);
+        return;
+      }
     }
 
     logger.info(`🔍 Processing page: ${pageData.url}`);
@@ -294,7 +357,9 @@ export class WebExplorer {
       let stepsOnThisPage = 0;
 
       // Take initial screenshot of the page
+      console.log("Time of initial screenshot:", new Date().toISOString());
       const screenshotBuffer = await this.page.screenshot({ fullPage: true });
+      console.log("Time of initial screenshot:", new Date().toISOString());
 
       // Save initial page screenshot
       const initialScreenshotPath = this.fileManager.saveScreenshot(
@@ -315,21 +380,36 @@ export class WebExplorer {
 
       logger.info(`📸 Initial page screenshot saved: ${initialScreenshotPath}`);
 
-      const conversationHistory: Array<{
-        role: "user" | "assistant";
-        content: string;
-      }> = [];
+      // Initialize page in GlobalStore with initial screenshot
+      this.globalStore.initializePage(
+        pageData.url,
+        pageData.urlHash,
+        `data:image/png;base64,${screenshotBuffer.toString("base64")}`
+      );
+
+      // Get page-level conversation history from GlobalStore
+      const conversationHistory = this.globalStore.getConversationHistory(
+        pageData.urlHash
+      );
 
       while (
         stepsOnThisPage < maxStepsPerPage &&
-        !this.session.metadata.objectiveAchieved
+        !this.session.metadata.objectiveAchieved &&
+        this.shouldContinueExploration() // 🆕 Check for chat interruption at step level
       ) {
-        // Check if user is still active before each step
-        if (!this.isUserStillActive()) {
-          logger.info(
-            `🛑 Stopping page processing loop - user no longer active`
-          );
-          return;
+        // Check if exploration should continue (not interrupted by chat)
+        if (!this.shouldContinueExploration()) {
+          if (this.isInterrupted) {
+            logger.info(
+              `⏸️ Page processing paused for chat at step ${this.session.globalStepCounter}`
+            );
+            return; // Gracefully exit to allow chat handling
+          } else {
+            logger.info(
+              `🛑 Stopping page processing loop - user no longer active`
+            );
+            return;
+          }
         }
 
         // Ask LLM to decide which tool to use next
@@ -342,13 +422,24 @@ export class WebExplorer {
         const maxPagesReached =
           this.session.metadata.totalPagesDiscovered >= this.maxPagesToExplore;
 
-        // Check if user is still active before LLM call
-        if (!this.isUserStillActive()) {
-          logger.info(
-            `🛑 Stopping before LLM decision - user no longer active`
-          );
-          return;
+        // Check if exploration should continue before LLM call
+        if (!this.shouldContinueExploration()) {
+          if (this.isInterrupted) {
+            logger.info(
+              `⏸️ Page processing paused for chat before LLM decision`
+            );
+            return; // Gracefully exit to allow chat handling
+          } else {
+            logger.info(
+              `🛑 Stopping before LLM decision - user no longer active`
+            );
+            return;
+          }
         }
+
+        // Get fresh conversation history for this page
+        const currentConversationHistory =
+          this.globalStore.getConversationHistory(pageData.urlHash);
 
         const decision = await this.llmClient.decideNextAction(
           currentScreenshotBuffer,
@@ -356,7 +447,7 @@ export class WebExplorer {
           this.session.metadata.objective,
           pageData.urlHash,
           this.session.globalStepCounter,
-          conversationHistory,
+          currentConversationHistory,
           this.session.pageQueue,
           this.session.pages,
           this.isExplorationObjective,
@@ -366,10 +457,19 @@ export class WebExplorer {
           this.session.actionHistory
         );
 
-        // Check if user is still active after LLM call
-        if (!this.isUserStillActive()) {
-          logger.info(`🛑 Stopping after LLM decision - user no longer active`);
-          return;
+        // Check if exploration should continue after LLM call
+        if (!this.shouldContinueExploration()) {
+          if (this.isInterrupted) {
+            logger.info(
+              `⏸️ Page processing paused for chat after LLM decision`
+            );
+            return; // Gracefully exit to allow chat handling
+          } else {
+            logger.info(
+              `🛑 Stopping after LLM decision - user no longer active`
+            );
+            return;
+          }
         }
 
         if (!decision) {
@@ -391,7 +491,7 @@ export class WebExplorer {
                 tool: decision.tool_to_use,
                 instruction: decision.tool_parameters.instruction,
                 reasoning: decision.reasoning,
-                nextPlan: decision.next_plan,
+                nextPlan: "",
                 isPageCompleted: decision.isCurrentPageExecutionCompleted,
               },
               maxPagesReached,
@@ -399,10 +499,12 @@ export class WebExplorer {
           });
         }
 
-        conversationHistory.push({
-          role: "assistant",
-          content: JSON.stringify(decision),
-        });
+        // Add decision to page-level conversation history
+        this.globalStore.addConversationMessage(
+          pageData.urlHash,
+          "assistant",
+          JSON.stringify(decision)
+        );
 
         // Add to session-level decision history
         const decisionEntry = {
@@ -419,7 +521,6 @@ export class WebExplorer {
         logger.info(`🤖 LLM Decision: ${decision.tool_to_use}`, {
           reasoning: decision.reasoning,
           instruction: decision.tool_parameters.instruction,
-          nextPlan: decision.next_plan,
           isCurrentPageExecutionCompleted:
             decision.isCurrentPageExecutionCompleted,
         });
@@ -485,10 +586,25 @@ export class WebExplorer {
           stepsOnThisPage++;
         }
 
-        // Check if tool execution was stopped due to user being inactive
+        // Check if tool execution was stopped due to user being inactive or chat interruption
         if (stepResult === null) {
           logger.info(`🛑 Tool execution stopped - user no longer active`);
           return;
+        }
+
+        // Check if exploration should continue after tool execution
+        if (!this.shouldContinueExploration()) {
+          if (this.isInterrupted) {
+            logger.info(
+              `⏸️ Page processing paused for chat after tool execution`
+            );
+            return; // Gracefully exit to allow chat handling
+          } else {
+            logger.info(
+              `🛑 Stopping after tool execution - user no longer active`
+            );
+            return;
+          }
         }
 
         // Emit tool execution completed event
@@ -512,10 +628,12 @@ export class WebExplorer {
           });
         }
 
-        conversationHistory.push({
-          role: "user",
-          content: `Tool result: ${JSON.stringify(stepResult)}`,
-        });
+        // Add tool result to page-level conversation history
+        this.globalStore.addConversationMessage(
+          pageData.urlHash,
+          "user",
+          `Tool result: ${JSON.stringify(stepResult)}`
+        );
 
         if (!stepResult) {
           logger.warn("❌ Tool execution failed, continuing...");
@@ -575,7 +693,6 @@ export class WebExplorer {
           logger.info("✅ LLM indicated current page execution is completed", {
             reason: "LLM set isCurrentPageExecutionCompleted to true",
             lastAction: decision.tool_parameters.instruction,
-            nextPlan: decision.next_plan,
           });
           this.saveSession();
           break;
@@ -1176,7 +1293,7 @@ Provide comprehensive insights rather than just listing visible elements. Analyz
    * Execute the chosen tool
    */
   private async executeTool(
-    toolName: "page_act" | "page_extract" | "user_input" | "standby",
+    toolName: "page_act" | "user_input" | "standby",
     instruction: string,
     pageData: PageData,
     screenshotBuffer: Buffer,
@@ -1209,155 +1326,6 @@ Provide comprehensive insights rather than just listing visible elements. Analyz
 
     try {
       switch (toolName) {
-        case "page_extract":
-          const extractResult = await this.toolPageExtract(instruction);
-
-          // Check if user is still active after tool execution
-          if (!this.isUserStillActive()) {
-            logger.info(
-              `🛑 Stopping after page_extract - user no longer active`
-            );
-            return null;
-          }
-
-          if (extractResult.success) {
-            step.success = true;
-            step.result = JSON.stringify(extractResult.data);
-
-            // 🆕 NEW COMPREHENSIVE EXTRACTION FORMATTING FLOW
-
-            // 1. Increment version number
-            pageData.currentExtractionVersion++;
-            const currentVersion = pageData.currentExtractionVersion;
-
-            // 2. Collect all screenshots from current page for LLM context
-            const screenshotBuffers = pageData.screenshots
-              .map((s) => s.buffer!)
-              .filter(Boolean);
-
-            // 3. Collect previous extraction data from current page only
-            const previousExtractions = pageData.extractionResults.map(
-              (r) => r.rawData
-            );
-            const previousMarkdowns = pageData.extractionResults.map(
-              (r) => r.formattedMarkdown
-            );
-
-            logger.info(`🔄 Processing extraction v${currentVersion}`, {
-              previousVersions: previousExtractions.length,
-              screenshotsAvailable: screenshotBuffers.length,
-              currentInstruction: instruction,
-            });
-
-            // Check if user is still active before comprehensive LLM call
-            if (!this.isUserStillActive()) {
-              logger.info(
-                `🛑 Stopping before comprehensive formatting - user no longer active`
-              );
-              return null;
-            }
-
-            // 4. 🆕 NEW LLM CALL: Comprehensive formatting with all context
-            const formattedMarkdown =
-              await this.llmClient.formatExtractionResults(
-                screenshotBuffers,
-                pageData.url,
-                this.session.metadata.objective,
-                pageData.urlHash,
-                this.session.globalStepCounter,
-                previousExtractions,
-                previousMarkdowns,
-                extractResult.data // Current extraction data
-              );
-
-            // Check if user is still active after formatting call
-            if (!this.isUserStillActive()) {
-              logger.info(
-                `🛑 Stopping after formatting - user no longer active`
-              );
-              return null;
-            }
-
-            // 5. Store versioned extraction result
-            const extractionResult: ExtractionResult = {
-              version: currentVersion,
-              timestamp: new Date().toISOString(),
-              rawData: extractResult.data,
-              formattedMarkdown:
-                formattedMarkdown ||
-                `# Extraction v${currentVersion}\n\n${JSON.stringify(extractResult.data, null, 2)}`,
-              stepNumber: this.session.globalStepCounter,
-            };
-
-            pageData.extractionResults.push(extractionResult);
-
-            // 6. Check objective completion using original method
-            if (!this.isExplorationObjective) {
-              const analysisResult = await this.llmClient.executePageExtract(
-                screenshotBuffer,
-                pageData.url,
-                instruction,
-                this.session.metadata.objective,
-                pageData.urlHash,
-                this.session.globalStepCounter,
-                extractResult
-              );
-
-              if (analysisResult) {
-                step.objectiveAchieved = analysisResult.objectiveAchieved;
-              }
-            }
-
-            // Check if user is still active after objective check
-            if (!this.isUserStillActive()) {
-              logger.info(
-                `🛑 Stopping after objective check - user no longer active`
-              );
-              return null;
-            }
-
-            // 7. Emit enhanced socket event with versioned data
-            if (this.socket && this.userName) {
-              this.socket.emit("exploration_update", {
-                type: "page_extract_result",
-                timestamp: new Date().toISOString(),
-                data: {
-                  userName: this.userName,
-                  url: pageData.url,
-                  urlHash: pageData.urlHash,
-                  stepNumber: this.session.globalStepCounter,
-                  instruction,
-                  // Latest formatted result for frontend
-                  extractedData: formattedMarkdown,
-                  // Version information
-                  version: currentVersion,
-                  totalVersions: pageData.extractionResults.length,
-                  isNewVersion: true, // 🆕 Notify frontend of changes
-                  // Legacy fields for compatibility
-                  elementsFound: extractResult.data?.elements_found || [],
-                  pageStructure: extractResult.data?.page_structure,
-                  interactiveElements:
-                    extractResult.data?.interactive_elements || [],
-                },
-              });
-            }
-
-            logger.info(
-              `📊 Enhanced page_extract completed v${currentVersion}`,
-              {
-                dataExtracted: true,
-                elementsFound: extractResult.data?.elements_found?.length || 0,
-                formattedLength: formattedMarkdown?.length || 0,
-                totalVersions: pageData.extractionResults.length,
-                screenshotsUsed: screenshotBuffers.length,
-              }
-            );
-          } else {
-            step.success = false;
-            step.result = extractResult.error;
-          }
-          break;
-
         case "page_act":
           const actionResult =
             await this.executeActionAndCheckUrlChange(instruction);
@@ -1392,6 +1360,21 @@ Provide comprehensive insights rather than just listing visible elements. Analyz
             // ✅ BOOLEAN FLAG: URL CHANGED - Set right before queuing logic
             const urlChangedFlag = true;
 
+            // 🚀 AUTOMATIC PAGE NAVIGATION GRAPH GENERATION
+            // When URL changes, automatically generate graph with page navigation relationship
+            this.generatePageNavigationGraph(
+              pageData.urlHash,
+              instruction,
+              pageData.url,
+              discoveredUrl
+            ).catch((error) => {
+              logger.error("❌ Failed to generate page navigation graph", {
+                error,
+                sourceUrl: pageData.url,
+                targetUrl: discoveredUrl,
+              });
+            });
+
             // Check if we're in a sensitive flow (login, signup, etc.)
             if (this.session.flowContext.isInSensitiveFlow) {
               // In sensitive flow - do NOT queue URL, just continue on new page
@@ -1418,6 +1401,41 @@ Provide comprehensive insights rather than just listing visible elements. Analyz
             step.urlChanged = urlChangedFlag;
             step.success = toolResult.success;
             step.result = `PREVIOUS_ACTION_RESULT: URL_CHANGED=false, STAYED_ON_SAME_PAGE=true, ACTION_RESULT=${toolResult.success ? "SUCCESS" : "FAILED"}`;
+          }
+
+          // 🆕 GlobalStore Integration: Add action to GlobalStore if URL didn't change
+          if (!discoveredUrl && toolResult.success) {
+            // Take after-action screenshot
+            const afterActionScreenshot = await this.page.screenshot({
+              fullPage: false,
+            });
+            const afterActionScreenshotPath = this.fileManager.saveScreenshot(
+              pageData.urlHash,
+              this.session.globalStepCounter,
+              "after_page_act",
+              afterActionScreenshot
+            );
+
+            // Store action in GlobalStore
+            this.globalStore.addAction(
+              pageData.urlHash,
+              instruction,
+              `data:image/png;base64,${afterActionScreenshot.toString("base64")}`,
+              this.session.globalStepCounter
+            );
+
+            // 🚀 NON-BLOCKING GRAPH GENERATION FLOW
+            // Note: Don't await these calls - they run in the background
+            this.startGraphGenerationFlow(
+              pageData.urlHash,
+              instruction,
+              `data:image/png;base64,${afterActionScreenshot.toString("base64")}`
+            ).catch((error) => {
+              logger.error("❌ Background graph generation failed", {
+                error,
+                urlHash: pageData.urlHash,
+              });
+            });
           }
 
           // Emit specific page_act event
@@ -1806,6 +1824,135 @@ Provide comprehensive insights rather than just listing visible elements. Analyz
   }
 
   /**
+   * Automatic page navigation graph generation when URL changes
+   * Bypasses Gemini confirmation and directly generates navigation relationship
+   */
+  private async generatePageNavigationGraph(
+    sourceUrlHash: string,
+    navigationAction: string,
+    sourceUrl: string,
+    targetUrl: string
+  ): Promise<void> {
+    try {
+      logger.info(`🔗 Generating page navigation graph`, {
+        sourceUrl,
+        targetUrl,
+        action: navigationAction,
+      });
+
+      // Get current graph for source page from GlobalStore
+      const sourcePageStore = this.globalStore.getPageStore(sourceUrlHash);
+      if (!sourcePageStore) {
+        logger.warn(`⚠️ No page store found for source URL: ${sourceUrl}`);
+        return;
+      }
+
+      const currentGraph = sourcePageStore.graph;
+
+      // Directly call Claude to generate updated graph with navigation relationship
+      const updatedGraph = await this.llmClient.generatePageNavigationGraph(
+        sourcePageStore,
+        currentGraph,
+        navigationAction,
+        sourceUrl,
+        targetUrl
+      );
+
+      if (updatedGraph) {
+        // Store updated graph
+        this.globalStore.updateGraph(sourceUrlHash, updatedGraph);
+
+        // Emit graph update event
+        if (this.socket && this.userName) {
+          this.socket.emit("exploration_update", {
+            type: "graph_updated",
+            timestamp: new Date().toISOString(),
+            data: {
+              userName: this.userName,
+              urlHash: sourceUrlHash,
+              graph: updatedGraph,
+              updateReason: "page_navigation",
+              navigationTarget: targetUrl,
+            },
+          });
+        }
+
+        logger.info(`✅ Page navigation graph updated`, {
+          sourceUrl,
+          targetUrl,
+          nodes: updatedGraph.nodes.length,
+          edges: updatedGraph.edges.length,
+        });
+      }
+    } catch (error: any) {
+      logger.error(`❌ Failed to generate page navigation graph`, {
+        error: error.message,
+        sourceUrl,
+        targetUrl,
+      });
+    }
+  }
+
+  /**
+   * Start non-blocking graph generation flow
+   */
+  private async startGraphGenerationFlow(
+    urlHash: string,
+    latestAction: string,
+    latestScreenshot: string
+  ): Promise<void> {
+    try {
+      // Step 1: Emit "updating graph" event
+      this.globalStore.emitGraphUpdating(urlHash);
+
+      // Step 2: Get page store data
+      const pageStore = this.globalStore.getPageStore(urlHash);
+      if (!pageStore) {
+        logger.warn(`⚠️ Page store not found for graph generation: ${urlHash}`);
+        return;
+      }
+
+      // Step 3: Ask Gemini if graph needs updating
+      const currentGraph = pageStore.graph;
+      const shouldUpdate = await this.llmClient.shouldUpdateGraph(
+        pageStore,
+        currentGraph,
+        latestAction,
+        latestScreenshot
+      );
+
+      if (!shouldUpdate) {
+        logger.info(`📊 Graph update not needed for: ${pageStore.url}`);
+        return;
+      }
+
+      // Step 4: Generate new graph with Claude
+      logger.info(`📊 Generating interaction graph for: ${pageStore.url}`);
+      const newGraph = await this.llmClient.generateInteractionGraph(
+        pageStore,
+        currentGraph
+      );
+
+      if (newGraph) {
+        // Step 5: Update GlobalStore with new graph
+        this.globalStore.updateGraph(urlHash, newGraph);
+
+        logger.info(`✅ Graph generation completed for: ${pageStore.url}`, {
+          nodes: newGraph.nodes.length,
+          edges: newGraph.edges.length,
+        });
+      } else {
+        logger.warn(`❌ Graph generation failed for: ${pageStore.url}`);
+      }
+    } catch (error: unknown) {
+      logger.error("❌ Graph generation flow failed", {
+        error: error instanceof Error ? error.message : String(error),
+        urlHash,
+      });
+    }
+  }
+
+  /**
    * Check if the user is still active in the exploration
    */
   private isUserStillActive(): boolean {
@@ -1820,5 +1967,299 @@ Provide comprehensive insights rather than just listing visible elements. Analyz
       );
     }
     return isActive;
+  }
+
+  /**
+   * Handle user chat message (interrupts exploration)
+   */
+  async handleChatMessage(userMessage: string): Promise<void> {
+    try {
+      logger.info(`🗨️ Chat message received, interrupting exploration`, {
+        userMessage,
+      });
+
+      // Create checkpoint before interrupting
+      this.createExplorationCheckpoint();
+
+      // Mark as interrupted to pause exploration
+      this.isInterrupted = true;
+
+      // Get chat decision from ChatAgent
+      const chatDecision = await this.chatAgent.handleChatMessage(
+        userMessage,
+        this.explorationCheckpoint!
+      );
+
+      console.log("Chat decision:", chatDecision);
+
+      logger.info(`🤖 Chat decision: ${chatDecision.requestType}`, {
+        targetUrl: chatDecision.targetUrl,
+        needsUserInput: chatDecision.needsUserInput,
+      });
+
+      // Handle the chat decision
+      await this.executeChatDecision(chatDecision);
+    } catch (error) {
+      console.log("Error in handleChatMessage:", error);
+      logger.error("❌ Chat message handling failed", { error });
+
+      // Send error response to user
+      if (this.socket && this.userName) {
+        this.socket.emit("exploration_update", {
+          type: "chat_error",
+          timestamp: new Date().toISOString(),
+          data: {
+            userName: this.userName,
+            error: "Failed to process your message. Please try again.",
+          },
+        });
+      }
+    }
+  }
+
+  /**
+   * Execute chat decision based on type
+   */
+  private async executeChatDecision(decision: ChatDecision): Promise<void> {
+    switch (decision.requestType) {
+      case "task_specific":
+        await this.handleTaskSpecificRequest(decision);
+        break;
+
+      case "exploration":
+        await this.handleExplorationRequest(decision);
+        break;
+
+      case "question":
+        await this.handleQuestionRequest(decision);
+        break;
+    }
+  }
+
+  /**
+   * Handle task-specific chat requests
+   */
+  private async handleTaskSpecificRequest(
+    decision: ChatDecision
+  ): Promise<void> {
+    try {
+      if (decision.targetUrl) {
+        // Navigate to target page
+        const navigationSuccess = await this.chatAgent.navigateToPage(
+          decision.targetUrl
+        );
+
+        if (navigationSuccess) {
+          const urlHash = FileManager.generateUrlHash(decision.targetUrl);
+
+          // Get page conversation history for context
+          const pageHistory =
+            this.chatAgent.getPageConversationHistory(urlHash);
+
+          // If it's a new page discovered during task, register it but stop exploration
+          if (!this.session.pages.has(urlHash)) {
+            logger.info(
+              `📄 New page discovered during task: ${decision.targetUrl}`
+            );
+            await this.addUrlToQueue(decision.targetUrl, 1);
+            // Don't add to regular exploration queue - it's task-specific
+          }
+
+          logger.info(`✅ Task-specific navigation completed`, {
+            url: decision.targetUrl,
+            hasPageHistory: pageHistory.length > 0,
+          });
+        }
+      }
+
+      // Continue with task execution...
+      // Note: This is where specific task logic would be implemented
+      // For now, we'll resume exploration after chat completion
+      await this.resumeExplorationAfterChat();
+    } catch (error) {
+      logger.error("❌ Task-specific request failed", { error });
+      await this.resumeExplorationAfterChat();
+    }
+  }
+
+  /**
+   * Handle exploration requests
+   */
+  private async handleExplorationRequest(
+    decision: ChatDecision
+  ): Promise<void> {
+    try {
+      if (decision.targetUrl) {
+        // Navigate to target page
+        const navigationSuccess = await this.chatAgent.navigateToPage(
+          decision.targetUrl
+        );
+
+        if (navigationSuccess) {
+          const urlHash = FileManager.generateUrlHash(decision.targetUrl);
+
+          // Add to exploration queue with normal flow
+          if (!this.session.pages.has(urlHash)) {
+            await this.addUrlToQueue(decision.targetUrl, 1);
+          }
+
+          // Continue exploration on this page
+          const pageData = this.session.pages.get(urlHash);
+          if (pageData) {
+            await this.processPage(pageData);
+          }
+        }
+      }
+
+      // Resume normal exploration
+      await this.resumeExplorationAfterChat();
+    } catch (error) {
+      logger.error("❌ Exploration request failed", { error });
+      await this.resumeExplorationAfterChat();
+    }
+  }
+
+  /**
+   * Handle question requests (no navigation needed)
+   */
+  private async handleQuestionRequest(decision: ChatDecision): Promise<void> {
+    // Question responses are already handled in ChatAgent
+    // Just resume exploration
+    await this.resumeExplorationAfterChat();
+  }
+
+  /**
+   * Create exploration checkpoint
+   */
+  private createExplorationCheckpoint(): void {
+    const currentUrl = this.page.url();
+    const currentPageHash = FileManager.generateUrlHash(currentUrl);
+
+    this.explorationCheckpoint = {
+      timestamp: new Date().toISOString(),
+      currentPageUrl: currentUrl,
+      currentPageHash: currentPageHash,
+      queuePosition: this.session.pageQueue.length,
+      remainingQueue: [...this.session.pageQueue],
+      explorationPhase:
+        this.session.pageQueue.length > 0 ? "active" : "completed",
+      lastStepNumber: this.session.globalStepCounter,
+    };
+
+    logger.info(`📍 Exploration checkpoint created`, {
+      currentUrl,
+      queueRemaining: this.session.pageQueue.length,
+      lastStep: this.session.globalStepCounter,
+    });
+
+    // Save checkpoint to file system
+    this.saveCheckpoint();
+  }
+
+  /**
+   * Resume exploration after chat completion
+   */
+  private async resumeExplorationAfterChat(): Promise<void> {
+    try {
+      logger.info(`🔄 Resuming exploration after chat`, {
+        hadCheckpoint: !!this.explorationCheckpoint,
+        queueRemaining: this.session.pageQueue.length,
+      });
+
+      // Mark as no longer interrupted
+      this.isInterrupted = false;
+
+      // If exploration was completed before interruption, don't resume
+      if (
+        !this.explorationCheckpoint ||
+        this.explorationCheckpoint.explorationPhase === "completed"
+      ) {
+        logger.info(
+          `✅ Exploration was already completed, staying ready for more chat`
+        );
+        return;
+      }
+
+      // Restore queue state if needed
+      if (this.explorationCheckpoint.remainingQueue.length > 0) {
+        this.session.pageQueue = [...this.explorationCheckpoint.remainingQueue];
+      }
+
+      // Continue with remaining exploration
+      if (this.session.pageQueue.length > 0) {
+        logger.info(`🚀 Continuing exploration from checkpoint`, {
+          queueSize: this.session.pageQueue.length,
+        });
+
+        // Resume exploration based on mode
+        if (this.isExplorationObjective) {
+          await this.exploreWithBackgroundProcessing();
+        } else {
+          await this.exploreSequentially();
+        }
+      } else {
+        logger.info(`✅ No more pages to explore, ready for new chat messages`);
+      }
+    } catch (error) {
+      logger.error("❌ Failed to resume exploration", { error });
+    }
+  }
+
+  /**
+   * Save checkpoint to file system
+   */
+  private saveCheckpoint(): void {
+    if (!this.explorationCheckpoint) return;
+
+    try {
+      const checkpointPath = path.join(
+        this.fileManager["sessionDir"],
+        "exploration_checkpoint.json"
+      );
+      fs.writeFileSync(
+        checkpointPath,
+        JSON.stringify(this.explorationCheckpoint, null, 2)
+      );
+
+      logger.info(`💾 Exploration checkpoint saved`, {
+        path: checkpointPath,
+        timestamp: this.explorationCheckpoint.timestamp,
+      });
+    } catch (error) {
+      logger.error("❌ Failed to save checkpoint", { error });
+    }
+  }
+
+  /**
+   * Load checkpoint from file system
+   */
+  private loadCheckpoint(): void {
+    try {
+      const checkpointPath = path.join(
+        this.fileManager["sessionDir"],
+        "exploration_checkpoint.json"
+      );
+
+      if (fs.existsSync(checkpointPath)) {
+        const checkpointData = JSON.parse(
+          fs.readFileSync(checkpointPath, "utf8")
+        );
+        this.explorationCheckpoint = checkpointData;
+
+        logger.info(`📂 Exploration checkpoint loaded`, {
+          timestamp: this.explorationCheckpoint?.timestamp,
+          queueRemaining: this.explorationCheckpoint?.remainingQueue.length,
+        });
+      }
+    } catch (error) {
+      logger.warn(`⚠️ Could not load exploration checkpoint`, { error });
+    }
+  }
+
+  /**
+   * Check if exploration should continue (not interrupted)
+   */
+  private shouldContinueExploration(): boolean {
+    return !this.isInterrupted && this.isUserStillActive();
   }
 }

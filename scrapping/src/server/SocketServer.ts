@@ -3,10 +3,15 @@ import { createServer } from "http";
 import fs from "fs";
 import path from "path";
 import logger from "../utils/logger.js";
-import { WebExplorer, FileManager, GlobalStagehandClient } from "../core/index.js";
+import {
+  WebExplorer,
+  FileManager,
+  GlobalStagehandClient,
+} from "../core/index.js";
 import { Stagehand } from "@browserbasehq/stagehand";
 import { chromium } from "playwright";
 import { anthropic } from "@ai-sdk/anthropic";
+import { vertex } from "@ai-sdk/google-vertex";
 
 interface ExecutionCommand {
   userName: string;
@@ -99,6 +104,50 @@ export class SocketServer {
         }
       );
 
+      // 🆕 Handle chat messages from user
+      socket.on(
+        "chat_message",
+        async (data: { userName: string; message: string }) => {
+          console.log("💬 Received chat message", data);
+          try {
+            logger.info("💬 Received chat message", {
+              userName: data.userName,
+              message: data.message.substring(0, 100),
+            });
+
+            const explorer = this.activeExplorations.get(data.userName);
+            if (explorer && "handleChatMessage" in explorer) {
+              // TypeScript cast to access the handleChatMessage method
+              await (explorer as any).handleChatMessage(data.message);
+            } else {
+              logger.warn("⚠️ No active explorer found for chat message", {
+                userName: data.userName,
+                activeExplorers: Array.from(this.activeExplorations.keys()),
+              });
+
+              socket.emit("chat_error", {
+                userName: data.userName,
+                error:
+                  "No active exploration session found. Please start an exploration first.",
+                timestamp: new Date().toISOString(),
+              });
+            }
+          } catch (error) {
+            console.log("Error in handleChatMessage:", error);
+            logger.error("❌ Failed to handle chat message", {
+              error,
+              userName: data.userName,
+            });
+
+            socket.emit("chat_error", {
+              userName: data.userName,
+              error: "Failed to process chat message. Please try again.",
+              timestamp: new Date().toISOString(),
+            });
+          }
+        }
+      );
+
       socket.on("disconnect", () => {
         logger.info("🔌 Client disconnected", { socketId: socket.id });
       });
@@ -142,7 +191,7 @@ export class SocketServer {
 
     try {
       const openaiClient = new GlobalStagehandClient({
-        model: anthropic("claude-3-5-sonnet-20241022"),
+        model: vertex("gemini-1.5-pro-002"),
       });
       // Create Stagehand client (which creates its own browser and page)
       const stagehand = new Stagehand({

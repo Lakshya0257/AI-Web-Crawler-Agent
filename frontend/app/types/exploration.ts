@@ -24,11 +24,54 @@ export interface UserInputRequest {
 }
 
 export interface LLMDecision {
-  tool: 'page_extract' | 'page_observe' | 'page_act' | 'standby';
+  tool: 'page_act' | 'user_input' | 'standby';
   instruction: string;
   reasoning: string;
   nextPlan: string;
   isPageCompleted: boolean;
+}
+
+export interface InteractionGraph {
+  pageUrl?: string;
+  pageSummary: string;
+  nodes: GraphNode[];
+  edges: GraphEdge[];
+  description: string;
+  lastUpdated: string;
+}
+
+export interface GraphNode {
+  id: string;
+  type: 'button' | 'link' | 'input' | 'dropdown' | 'toggle' | 'tab' | 'section' | 'state' | 'dialog' | 'navigation_target';
+  label: string;
+  description: string;
+  selector?: string;
+  actionable?: boolean;
+  position?: {
+    x: number;
+    y: number;
+  };
+}
+
+export interface GraphEdge {
+  from: string;
+  to: string;
+  action: string;
+  description: string;
+}
+
+export interface ChatMessage {
+  id: string;
+  type: 'user' | 'assistant';
+  content: string;
+  timestamp: string;
+  requestType?: 'task_specific' | 'exploration' | 'question';
+}
+
+export interface ChatState {
+  messages: ChatMessage[];
+  isActive: boolean;
+  isProcessing: boolean;
 }
 
 export interface ToolResult {
@@ -45,17 +88,6 @@ export interface PageObserveResult extends ToolResult {
   interactiveElements: string[];
   navigationOptions: string[];
   formsPresent: boolean;
-}
-
-export interface PageExtractResult extends ToolResult {
-  extractedData: string; // Now contains formatted markdown
-  elementsFound: string[];
-  pageStructure: string;
-  interactiveElements: string[];
-  // Enhanced versioning system
-  version: number;
-  totalVersions: number;
-  isNewVersion: boolean; // Notify frontend of changes
 }
 
 export interface PageActResult extends ToolResult {
@@ -99,6 +131,8 @@ export interface PageStatus {
   status: 'in_progress' | 'completed';
   stepsExecuted?: number;
   timestamp: string;
+  hasGraph?: boolean;
+  graphLastUpdated?: string;
 }
 
 export interface SessionCompletion {
@@ -114,9 +148,11 @@ export interface SessionCompletion {
 
 export interface ExplorationUpdate {
   type: 'page_started' | 'page_completed' | 'llm_decision' | 'tool_execution_started' | 
-        'tool_execution_completed' | 'page_extract_result' | 
-        'page_act_result' | 'url_discovered' | 'screenshot_captured' | 'session_completed' |
-        'user_input_request' | 'user_input_received' | 'standby_completed';
+        'tool_execution_completed' | 'after_page_act' | 'page_act_result' | 'url_discovered' | 
+        'screenshot_captured' | 'session_completed' | 'user_input_request' | 
+        'user_input_received' | 'standby_completed' | 
+        'updating_graph' | 'graph_updated' | 
+        'chat_message' | 'chat_navigation' | 'chat_error';
   timestamp: string;
   data: any;
 }
@@ -136,7 +172,6 @@ export interface ExplorationState {
   }>;
   toolResults: {
     observe: PageObserveResult[];
-    extract: PageExtractResult[];
     act: PageActResult[];
     standby: StandbyResult[];
   };
@@ -150,4 +185,7 @@ export interface ExplorationState {
     stepNumber: number;
   } | null;
   userInputRequest: UserInputRequest | null;
+  graphs: { [urlHash: string]: InteractionGraph };
+  chatState: ChatState;
+  isGraphUpdating: boolean;
 } 
