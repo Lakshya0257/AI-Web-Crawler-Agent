@@ -8,7 +8,7 @@ import { Label } from './label';
 import { Switch } from './switch';
 import { Badge } from './badge';
 import { Separator } from './separator';
-import { Eye, EyeOff, Key, Mail, Phone, Link2, MessageSquare, Shield } from 'lucide-react';
+import { Eye, EyeOff, Key, Mail, Phone, Link2, MessageSquare, Shield, SkipForward } from 'lucide-react';
 import type { InputRequest, UserInputRequest } from '../../types/exploration';
 
 interface UserInputDialogProps {
@@ -16,13 +16,15 @@ interface UserInputDialogProps {
   onClose: () => void;
   userInputRequest: UserInputRequest | null;
   onSubmit: (inputs: { [key: string]: string }) => void;
+  onSkip: () => void;
 }
 
 export function UserInputDialog({ 
   isOpen, 
   onClose, 
   userInputRequest, 
-  onSubmit 
+  onSubmit,
+  onSkip
 }: UserInputDialogProps) {
   const [inputValues, setInputValues] = useState<{ [key: string]: string }>({});
   const [showPassword, setShowPassword] = useState<{ [key: string]: boolean }>({});
@@ -82,6 +84,18 @@ export function UserInputDialog({
       // when the backend clears userInputRequest from state after processing
     } catch (error) {
       console.error('Error submitting user input:', error);
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const handleSkip = async () => {
+    setIsSubmitting(true);
+    try {
+      await onSkip();
+      // Dialog will close automatically when backend processes the skip
+    } catch (error) {
+      console.error('Error skipping user input:', error);
     } finally {
       setIsSubmitting(false);
     }
@@ -248,6 +262,24 @@ export function UserInputDialog({
             className="text-sm"
           >
             Cancel Exploration
+          </Button>
+          <Button
+            variant="secondary"
+            onClick={handleSkip}
+            disabled={isSubmitting}
+            className="text-sm gap-2"
+          >
+            {isSubmitting ? (
+              <>
+                <div className="w-3 h-3 border-2 border-current border-t-transparent rounded-full animate-spin" />
+                Skipping...
+              </>
+            ) : (
+              <>
+                <SkipForward className="w-3 h-3" />
+                Skip & Continue
+              </>
+            )}
           </Button>
           <Button
             onClick={handleSubmit}

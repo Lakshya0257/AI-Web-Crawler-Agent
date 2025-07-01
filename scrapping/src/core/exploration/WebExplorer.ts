@@ -393,7 +393,7 @@ export class WebExplorer {
       );
 
       while (
-        stepsOnThisPage < maxStepsPerPage &&
+        // stepsOnThisPage < maxStepsPerPage &&
         !this.session.metadata.objectiveAchieved &&
         this.shouldContinueExploration() // 🆕 Check for chat interruption at step level
       ) {
@@ -474,6 +474,17 @@ export class WebExplorer {
 
         if (!decision) {
           logger.warn("❌ Failed to get LLM decision, moving to next page");
+          break;
+        }
+
+        if (
+          this.session.flowContext.isInSensitiveFlow &&
+          !decision.isInSensitiveFlow
+        ) {
+          this.session.flowContext.isInSensitiveFlow = false;
+          const newUrl = this.normalizeUrl(this.page.url());
+          logger.info(`🚫 Sensitive flow ended, redirecting to ${newUrl}`);
+          await this.addUrlToQueue(newUrl, 1);
           break;
         }
 
@@ -592,6 +603,24 @@ export class WebExplorer {
           return;
         }
 
+        if (
+          stepResult.result &&
+          stepResult.result.includes("skipped") &&
+          decision.tool_to_use === "user_input"
+        ) {
+          this.globalStore.addConversationMessage(
+            pageData.urlHash,
+            "user",
+            "User skipped the input prompt, so skip this step and do something else."
+          );
+        } else {
+          this.globalStore.addConversationMessage(
+            pageData.urlHash,
+            "user",
+            `Tool result: ${JSON.stringify(stepResult)}`
+          );
+        }
+
         // Check if exploration should continue after tool execution
         if (!this.shouldContinueExploration()) {
           if (this.isInterrupted) {
@@ -627,13 +656,6 @@ export class WebExplorer {
             },
           });
         }
-
-        // Add tool result to page-level conversation history
-        this.globalStore.addConversationMessage(
-          pageData.urlHash,
-          "user",
-          `Tool result: ${JSON.stringify(stepResult)}`
-        );
 
         if (!stepResult) {
           logger.warn("❌ Tool execution failed, continuing...");
@@ -1011,6 +1033,7 @@ Provide comprehensive insights rather than just listing visible elements. Analyz
   ): Promise<{
     success: boolean;
     inputs?: { [key: string]: string };
+    isSkipped?: boolean;
     error?: string;
   }> {
     if (!this.socket || !this.userName) {
@@ -1063,21 +1086,51 @@ Provide comprehensive insights rather than just listing visible elements. Analyz
 
         // Set up listener for multiple input responses
         const inputResponseHandler = (data: {
-          inputs: { [key: string]: string };
+          inputs?: { [key: string]: string };
+          isSkipped?: boolean;
         }) => {
-          logger.info(`📥 Received user_input_response from frontend`, {
-            userName: this.userName,
-            inputKeys: Object.keys(data.inputs).join(", "),
-            inputCount: Object.keys(data.inputs).length,
-          });
+          if (data.isSkipped) {
+            logger.info(`⏭️ User input skipped from frontend`, {
+              userName: this.userName,
+              skipRequested: true,
+            });
 
-          clearTimeout(timeout);
-          this.socket!.off("user_input_response", inputResponseHandler);
+            clearTimeout(timeout);
+            this.socket!.off("user_input_response", inputResponseHandler);
 
-          resolve({
-            success: true,
-            inputs: data.inputs,
-          });
+            resolve({
+              success: true,
+              isSkipped: true,
+            });
+          } else if (data.inputs) {
+            logger.info(`📥 Received user_input_response from frontend`, {
+              userName: this.userName,
+              inputKeys: Object.keys(data.inputs).join(", "),
+              inputCount: Object.keys(data.inputs).length,
+            });
+
+            clearTimeout(timeout);
+            this.socket!.off("user_input_response", inputResponseHandler);
+
+            resolve({
+              success: true,
+              inputs: data.inputs,
+            });
+          } else {
+            logger.error(`❌ Invalid user_input_response from frontend`, {
+              userName: this.userName,
+              data,
+            });
+
+            clearTimeout(timeout);
+            this.socket!.off("user_input_response", inputResponseHandler);
+
+            resolve({
+              success: false,
+              error:
+                "Invalid user input response: no inputs or skip signal provided",
+            });
+          }
         };
 
         // Listen for user input response
@@ -1146,6 +1199,7 @@ Provide comprehensive insights rather than just listing visible elements. Analyz
       let inputResult: {
         success: boolean;
         inputs?: { [key: string]: string };
+        isSkipped?: boolean;
         error?: string;
       };
 
@@ -1187,7 +1241,31 @@ Provide comprehensive insights rather than just listing visible elements. Analyz
 
       logger.info("inputResult check", inputResult);
 
-      if (inputResult.success && inputResult.inputs) {
+      if (inputResult.success && inputResult.isSkipped) {
+        // Handle skip case - mark as successful and continue normal flow
+        step.success = true;
+        step.result = "User input skipped - continuing with normal flow";
+
+        // Emit user input received event
+        if (this.socket && this.userName) {
+          this.socket.emit("exploration_update", {
+            type: "user_input_received",
+            timestamp: new Date().toISOString(),
+            data: {
+              userName: this.userName,
+              url: pageData.url,
+              urlHash: pageData.urlHash,
+              stepNumber: this.session.globalStepCounter,
+              inputKeys: [],
+              inputValues: {},
+              inputReceived: false,
+              isSkipped: true,
+            },
+          });
+        }
+
+        logger.info(`⏭️ user_input skipped - continuing normal flow`);
+      } else if (inputResult.success && inputResult.inputs) {
         step.success = true;
 
         const inputKeys = Object.keys(inputResult.inputs);

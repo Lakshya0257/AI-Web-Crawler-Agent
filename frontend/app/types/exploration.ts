@@ -23,6 +23,11 @@ export interface UserInputRequest {
   timestamp: string;
 }
 
+export interface UserInputResponse {
+  inputs?: { [key: string]: string };
+  isSkipped?: boolean;
+}
+
 export interface LLMDecision {
   tool: 'page_act' | 'user_input' | 'standby';
   instruction: string;

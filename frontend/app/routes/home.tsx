@@ -64,7 +64,8 @@ export default function Home() {
     explorationState, 
     startExploration, 
     stopExploration, 
-    submitUserInput, 
+    submitUserInput,
+    skipUserInput,
     sendChatMessage,
     toggleChatMode,
     isConnected, 
@@ -713,6 +714,7 @@ Goal: Map the entire user experience and create detailed interaction graphs for 
           <UserInputDialog
             userInputRequest={explorationState.userInputRequest}
             onSubmit={submitUserInput}
+            onSkip={skipUserInput}
             onClose={() => {
               if (explorationState.userInputRequest && config.userName) {
                 stopExploration(config.userName);

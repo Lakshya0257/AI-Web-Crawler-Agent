@@ -92,13 +92,19 @@ export class SocketServer {
         });
       });
 
-      // Handle user input response (updated for multiple inputs)
+      // Handle user input response (updated for multiple inputs and skip)
       socket.on(
         "user_input_response",
-        (data: { inputs: { [key: string]: string } }) => {
-          logger.info("📥 Received user input response", {
-            inputKeys: Object.keys(data.inputs),
-          });
+        (data: { inputs?: { [key: string]: string }; isSkipped?: boolean }) => {
+          if (data.isSkipped) {
+            logger.info("⏭️ Received user input skip request");
+          } else if (data.inputs) {
+            logger.info("📥 Received user input response", {
+              inputKeys: Object.keys(data.inputs),
+            });
+          } else {
+            logger.warn("⚠️ Invalid user input response - no inputs or skip signal");
+          }
           // The input response is automatically handled by the WebExplorer's toolUserInput method
           // which is listening for this event on the same socket
         }

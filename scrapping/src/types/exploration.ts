@@ -163,6 +163,11 @@ export interface UserInputRequest {
   timestamp: string;
 }
 
+export interface UserInputSocketResponse {
+  inputs?: { [key: string]: string };
+  isSkipped?: boolean;
+}
+
 export interface UserInputData {
   key: string;
   value: string;

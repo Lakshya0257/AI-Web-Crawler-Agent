@@ -317,6 +317,13 @@ export function useSocket() {
     }
   }, [socket, explorationState.userInputRequest]);
 
+  const skipUserInput = useCallback(() => {
+    if (socket && explorationState.userInputRequest) {
+      socket.emit('user_input_response', { isSkipped: true });
+      console.log('⏭️ Skipping user input');
+    }
+  }, [socket, explorationState.userInputRequest]);
+
   // New chat functionality
   const sendChatMessage = useCallback((message: string, userName: string) => {
     if (socket && explorationState.isConnected) {
@@ -362,6 +369,7 @@ export function useSocket() {
     startExploration,
     stopExploration,
     submitUserInput,
+    skipUserInput,
     sendChatMessage,
     toggleChatMode,
     isConnected: explorationState.isConnected,

@@ -163,6 +163,7 @@ ${
 - Use the user_input tool to request emails, passwords, OTP codes, verification links
 - You can handle authentication flows, signup processes, and account access
 - Request user confirmation for actions that require human verification
+- Do not explore in the login process, just simply login. You dont have to register or sign up only login should happen.
 
 ⚠️ IMPORTANT LOGIN RESTRICTIONS:
 - ONLY use direct/normal login forms (username/email + password)
@@ -172,6 +173,7 @@ ${
 - If only third-party login options are available, inform the user and skip login
 - Look for "Sign in with email" or "Use password instead" options when available
 - Do not attempt to click on forget password button
+- Do not explore in the login process, just simply login. You dont have to register or sign up only login should happen.
 `
     : `
 🚫 LOGIN DISABLED:
@@ -277,6 +279,7 @@ EXAMPLE BAD REASONING:
 
 🚨 MANDATORY CONFIRMATION REQUIRED - NO EXCEPTIONS:
 Before performing ANY action that could manipulate, change, or affect data, you MUST use the user_input tool to get explicit confirmation first!
+Like creating a new task, inviting someone, deleting something, clicking on forget password etc
 
 ACTIONS REQUIRING CONFIRMATION (NON-EXHAUSTIVE LIST):
 🛑 CREATE/REGISTER:

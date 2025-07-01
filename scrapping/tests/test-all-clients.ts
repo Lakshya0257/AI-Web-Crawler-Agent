@@ -76,7 +76,7 @@ async function testStagehandClients() {
 
       // Customize the system prompt
       instructions: `You are a helpful assistant that can use a web browser.
-	Do not ask follow up questions, the user will trust your judgement.`,
+	Do not ask follow up questions, the user will trust your judgement. Also only do that action what user have asked, don't do anything else.`,
 
       // Customize the API key
       options: {
