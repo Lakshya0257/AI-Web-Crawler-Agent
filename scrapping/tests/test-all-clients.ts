@@ -70,9 +70,9 @@ async function testStagehandClients() {
 
     const agent = stagehandClaude.agent({
       // You can use either OpenAI or Anthropic
-      provider: "anthropic",
+      provider: "openai",
       // The model to use (claude-3-7-sonnet-latest for Anthropic)
-      model: "claude-3-7-sonnet-latest",
+      model: "gpt-4.1-mini",
 
       // Customize the system prompt
       instructions: `You are a helpful assistant that can use a web browser.
@@ -80,7 +80,7 @@ async function testStagehandClients() {
 
       // Customize the API key
       options: {
-        apiKey: process.env.ANTHROPIC_API_KEY,
+        apiKey: process.env.OPENAI_API_KEY,
       },
     });
 

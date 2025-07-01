@@ -35,10 +35,10 @@ export class LLMClient {
     // Vertex AI authentication should be set up via Application Default Credentials
 
     // Initialize Vertex AI model (Gemini)
-    this.model = vertex("gemini-1.5-pro");
+    this.model = vertex("gemini-2.5-flash");
 
     // Initialize Claude model for graph generation
-    this.claudeModel = anthropic("claude-3-5-sonnet-20241022");
+    this.claudeModel = anthropic("claude-4-sonnet-20250514");
 
     this.additionalContext = additionalContext;
     this.canLogin = canLogin;
