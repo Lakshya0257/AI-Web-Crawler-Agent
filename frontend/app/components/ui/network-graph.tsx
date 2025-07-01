@@ -26,7 +26,7 @@ import {
   Network, MousePointer, Link2, ToggleLeft, FileText, 
   Square, Circle, Globe, Info, ZoomIn, ZoomOut, Maximize 
 } from 'lucide-react';
-import type { InteractionGraph, GraphNode as GraphNodeType, GraphEdge } from '../../types/exploration';
+import type { InteractionGraph, GraphNode as GraphNodeType, GraphEdge, GraphNode } from '../../types/exploration';
 import { Separator } from './separator';
 
 interface NetworkGraphProps {
@@ -67,7 +67,10 @@ const getNodeIcon = (type: string) => {
 };
 
 // Custom Node Component with Handles
-const CustomNode: React.FC<NodeProps> = ({ data, isConnectable }) => {
+const CustomNode = ({ data, isConnectable }: {
+  data: GraphNode;
+  isConnectable: boolean
+}) => {
   const colors = getNodeColor(data.type);
   
   return (
@@ -319,6 +322,7 @@ export function NetworkGraph({ graph, className = '' }: NetworkGraphProps) {
               <MiniMap 
                 className="bg-white border border-gray-200 rounded-lg shadow-md"
                 maskColor="rgba(0, 0, 0, 0.1)"
+                // @ts-ignore
                 nodeColor={(node) => getNodeColor(node.data["type"] || 'default').bg}
                 pannable
                 zoomable

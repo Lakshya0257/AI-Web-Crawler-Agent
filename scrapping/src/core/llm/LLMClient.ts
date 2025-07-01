@@ -249,19 +249,89 @@ ${previousActionContext}
 
 🔍 CRITICAL: OBSERVE THE SCREENSHOT CAREFULLY BEFORE MAKING ANY DECISION!
 Analyze the visual elements, text, buttons, forms, and overall page state in the screenshot.
-The screenshot shows the CURRENT EXACT STATE of the webpage - base all decisions on what you see, after any page act, first see that if your next action can be done on same page or not, or what that previous page_act added a new url to the queue and you are trying to extract it
+The screenshot shows the CURRENT EXACT STATE of the webpage - base all decisions on what you see.
 
-🚨 CRITICAL ACTION CONFIRMATION REQUIRED:
-Before performing ANY action that could:
-- CREATE new data/content (posts, accounts, orders, etc.)
-- DELETE existing data/content
-- MODIFY existing information
-- SUBMIT forms with significant impact
-- MAKE purchases or financial transactions
-- CHANGE account settings or preferences
+🚫 NEVER ASSUME - ONLY OBSERVE:
+- Do NOT assume error messages that aren't visible in the screenshot
+- Do NOT assume login failed without seeing actual error text
+- Do NOT assume success/failure based on URL changes alone
+- Do NOT make inferences about page state - only describe what you see
+- Do NOT conclude anything not directly visible in the screenshot
 
-You MUST use the user_input tool to get confirmation first!
-Example: "Do you want me to create a new account with the email address user@example.com? (yes/no)"
+✅ SCREENSHOT-BASED DECISION MAKING:
+- Look for specific text, buttons, forms, and UI elements
+- Identify error messages by reading actual text shown
+- Determine page state by visual layout and content
+- Base reasoning on visible elements, not technical assumptions
+- If unclear, describe exactly what you see and ask for clarification
+
+EXAMPLE GOOD REASONING:
+✅ "I can see a dashboard with navigation menu and user profile, indicating successful login"
+✅ "The screenshot shows the text 'Invalid password' below the password field"
+✅ "I see a contact form with Name, Email, and Message fields ready to be filled"
+
+EXAMPLE BAD REASONING:
+❌ "Login probably failed because URL didn't change"
+❌ "There might be an error message" (when none is visible)
+❌ "The form submission likely failed" (without seeing error indicators)
+
+🚨 MANDATORY CONFIRMATION REQUIRED - NO EXCEPTIONS:
+Before performing ANY action that could manipulate, change, or affect data, you MUST use the user_input tool to get explicit confirmation first!
+
+ACTIONS REQUIRING CONFIRMATION (NON-EXHAUSTIVE LIST):
+🛑 CREATE/REGISTER:
+- Creating accounts/profiles
+- Registering for services
+- Adding items to cart/wishlist
+- Creating posts/comments/reviews
+- Signing up for newsletters
+- Creating any new content
+
+🛑 DELETE/REMOVE:
+- Deleting accounts/profiles
+- Removing items from cart
+- Deleting posts/comments
+- Unsubscribing from services
+- Removing any existing data
+
+🛑 MODIFY/UPDATE:
+- Changing account settings/preferences
+- Updating profile information
+- Editing existing content
+- Changing passwords/security settings
+- Modifying any existing data
+
+🛑 SUBMIT/SEND:
+- Submitting contact forms
+- Sending messages/emails
+- Placing orders/purchases
+- Submitting reviews/ratings
+- Any form submission with personal data
+
+🛑 FINANCIAL/TRANSACTIONS:
+- Making purchases/payments
+- Adding payment methods
+- Changing billing information
+- Any money-related actions
+
+🚫 ABSOLUTELY NO EXCEPTIONS:
+- Even if it seems harmless, ASK FIRST
+- Even if it's "just testing", ASK FIRST  
+- Even if you think the user wants it, ASK FIRST
+- Better to ask unnecessarily than act without permission
+
+✅ CONFIRMATION EXAMPLES:
+- "I found a signup form. Should I create an account with email user@example.com? (yes/no)"
+- "There's an 'Add to Cart' button for Product X ($29.99). Should I add it? (yes/no)"
+- "I can submit this contact form with your message. Should I proceed? (yes/no)"
+- "There's a 'Delete Account' option. Do you want me to click it? (yes/no)"
+
+🔍 SAFE ACTIONS (NO CONFIRMATION NEEDED):
+- Clicking navigation links (About, Contact, Home, etc.)
+- Opening dropdowns/menus to explore options
+- Scrolling to view content
+- Clicking to view product details (without adding to cart)
+- Browsing/viewing content only
 
 Available tools:
 - page_act: Perform actions on the page (click, type, scroll to a section, scroll to bottom etc.) - provide instruction parameter
@@ -385,9 +455,36 @@ Set this to TRUE when you are confident that:
 - Do NOT set to true for general forms, registration, verification, checkout, or other non-login flows
 - Only use for actual username/email + password authentication processes
 
+🔍 CRITICAL LOGIN FLOW ANALYSIS - OBSERVE SCREENSHOT ONLY:
+During login flows, you MUST base ALL decisions on what you actually SEE in the screenshot, NOT on assumptions:
+
+✅ LOGIN SUCCESS INDICATORS (what to look for in screenshot):
+- Dashboard/main page content visible
+- User profile/account information shown
+- "Welcome" or user name displayed
+- Navigation menus for logged-in users
+- Account settings or logout options visible
+- Different page layout indicating successful login
+
+❌ LOGIN FAILURE INDICATORS (what to look for in screenshot):
+- Still on login page with login form visible
+- Error messages actually visible in screenshot
+- "Invalid email or password" text actually shown
+- Form validation errors displayed
+- Login button still prominently displayed
+
+🚫 DO NOT ASSUME:
+- Do NOT assume login failed just because URL didn't change
+- Do NOT assume error messages that aren't visible in screenshot
+- Do NOT conclude failure without seeing actual error indicators
+- URL changes during login are NORMAL and expected
+- Some sites redirect through multiple pages during login
+
 LOGIN FLOW EXAMPLE:
-❌ Wrong: After "Click the 'LOGIN' button" → isCurrentPageExecutionCompleted: true
-✅ Correct: After "Click the 'LOGIN' button" → isCurrentPageExecutionCompleted: false (continue on dashboard)
+❌ Wrong: "URL didn't change, so login failed" 
+✅ Correct: "I can see the dashboard with user menu, login was successful"
+❌ Wrong: "Login failed because no redirect occurred"
+✅ Correct: "The screenshot shows [specific content], indicating [success/failure]"
 
 Examples when to set TRUE:
 - If objective is "Find pricing" and you see a "Pricing" link → set to true when clicking it
@@ -631,12 +728,10 @@ Remember: Break down complex actions into simple steps. One action per step.`;
       });
 
       const parsedResponse = JSON.parse(cleanedContent) as LLMDecisionResponse;
-      this.fileManager.saveLLMResponse(
-        urlHash,
-        stepNumber,
-        "decision",
-        parsedResponse
-      );
+      this.fileManager.saveLLMResponse(urlHash, stepNumber, "decision", {
+        ...parsedResponse,
+        image: `data:image/png;base64,${base64Image}`,
+      });
 
       return parsedResponse;
     } catch (error) {
@@ -1202,8 +1297,14 @@ Provide the ULTIMATE COMPREHENSIVE FINAL REPORT that preserves all previous cont
     try {
       // Define Zod schema for graph update decision
       const GraphUpdateDecisionSchema = z.object({
-        needsUpdate: z.boolean().describe("Whether the interaction graph needs to be updated"),
-        reasoning: z.string().describe("Brief explanation of why the graph does/doesn't need updating")
+        needsUpdate: z
+          .boolean()
+          .describe("Whether the interaction graph needs to be updated"),
+        reasoning: z
+          .string()
+          .describe(
+            "Brief explanation of why the graph does/doesn't need updating"
+          ),
       });
 
       const systemPrompt = `You are analyzing whether an interaction graph needs to be updated after a page action.
@@ -1229,7 +1330,7 @@ Analyze the screenshot and determine if the graph needs updating.`;
 
       // Build interleaved conversation history for graph update decision
       const interleavedMessages = this.buildInterleavedConversationHistory(
-        globalStore, 
+        globalStore,
         latestScreenshot
       );
 
@@ -1247,7 +1348,7 @@ Analyze the screenshot and determine if the graph needs updating.`;
       logger.info(`📸 Gemini graph update decision using interleaved history`, {
         totalActions: globalStore.actionHistory.length,
         totalMessages: interleavedMessages.length,
-        latestAction
+        latestAction,
       });
 
       const response = await generateObject({
@@ -1394,9 +1495,11 @@ Respond with ONLY valid JSON:
 
       // Build interleaved conversation history for navigation graph generation
       const interleavedMessages = this.buildInterleavedConversationHistory(
-        sourcePageStore, 
-        sourcePageStore.actionHistory.length > 0 
-          ? sourcePageStore.actionHistory[sourcePageStore.actionHistory.length - 1].after_act 
+        sourcePageStore,
+        sourcePageStore.actionHistory.length > 0
+          ? sourcePageStore.actionHistory[
+              sourcePageStore.actionHistory.length - 1
+            ].after_act
           : sourcePageStore.initialScreenshot
       );
 
@@ -1414,7 +1517,7 @@ Respond with ONLY valid JSON:
       logger.info(`📸 Claude navigation graph using interleaved history`, {
         totalActions: sourcePageStore.actionHistory.length,
         totalMessages: interleavedMessages.length,
-        navigationAction
+        navigationAction,
       });
 
       const response = await generateText({
@@ -1566,9 +1669,10 @@ Respond with ONLY valid JSON:
 
       // Build interleaved conversation history for graph generation
       const interleavedMessages = this.buildInterleavedConversationHistory(
-        globalStore, 
-        globalStore.actionHistory.length > 0 
-          ? globalStore.actionHistory[globalStore.actionHistory.length - 1].after_act 
+        globalStore,
+        globalStore.actionHistory.length > 0
+          ? globalStore.actionHistory[globalStore.actionHistory.length - 1]
+              .after_act
           : globalStore.initialScreenshot
       );
 
@@ -1585,7 +1689,7 @@ Respond with ONLY valid JSON:
 
       logger.info(`📸 Claude graph generation using interleaved history`, {
         totalActions: globalStore.actionHistory.length,
-        totalMessages: interleavedMessages.length
+        totalMessages: interleavedMessages.length,
       });
 
       const response = await generateText({
