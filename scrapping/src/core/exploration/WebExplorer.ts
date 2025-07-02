@@ -1,27 +1,16 @@
 import { Browser, Page } from "playwright";
 import { Stagehand } from "@browserbasehq/stagehand";
-import { z } from "zod";
 import fs from "fs";
 import path from "path";
 import logger from "../../utils/logger.js";
 import { FileManager } from "../storage/FileManager.js";
 import { GlobalStore } from "../storage/GlobalStore.js";
 import { LLMClient } from "../llm/LLMClient.js";
-import {
-  ChatAgent,
-  ExplorationCheckpoint,
-  ChatDecision,
-  ChatMessage,
-} from "./ChatAgent.js";
+import { ChatAgent, ExplorationCheckpoint, ChatDecision } from "./ChatAgent.js";
 import {
   ExplorationSession,
-  SessionMetadata,
   PageData,
   ExecutedStep,
-  UserInputData,
-  FlowContext,
-  ExtractionResult,
-  PageScreenshot,
 } from "../../types/exploration.js";
 import type { Socket } from "socket.io";
 
@@ -34,7 +23,6 @@ export class WebExplorer {
   private stagehand: Stagehand;
   private sessionDecisionHistory: any[] = []; // Track all decisions made during the session
   private isExplorationObjective: boolean; // Add exploration mode detection
-  private activeProcessingPromises: Map<string, Promise<void>> = new Map(); // Track background processing
   private maxPagesToExplore: number; // Maximum pages to explore
   protected socket?: Socket;
   protected userName?: string;
@@ -204,96 +192,6 @@ export class WebExplorer {
     }
 
     return await this.finalizeSession(false);
-  }
-
-  /**
-   * Background processing exploration for exploration objectives
-   */
-  private async exploreWithBackgroundProcessing(): Promise<boolean> {
-    logger.info("🔍 Starting exploration mode with background processing");
-
-    // Process pages with background processing
-    while (true) {
-      // Check if exploration should continue (not interrupted by chat)
-      if (!this.shouldContinueExploration()) {
-        if (this.isInterrupted) {
-          logger.info("⏸️ Background exploration paused for chat");
-          await this.waitForAllProcessingToComplete();
-          return true; // Return true to indicate graceful pause, not failure
-        } else {
-          logger.info(
-            "🛑 Stopping background exploration - user no longer active"
-          );
-          return await this.finalizeSession(false);
-        }
-      }
-
-      // Check if objective is achieved
-      if (this.session.metadata.objectiveAchieved) {
-        logger.info("✅ Objective achieved!");
-        // Wait for all background processing to complete
-        await this.waitForAllProcessingToComplete();
-        return await this.finalizeSession(true);
-      }
-
-      // Check if we have queued pages to process
-      if (this.session.pageQueue.length > 0) {
-        // Get next page from queue
-        const urlHash = this.session.pageQueue.shift()!;
-        const pageData = this.session.pages.get(urlHash)!;
-
-        // Start processing in background (don't await)
-        const processingPromise = this.processPage(pageData).finally(() => {
-          // Clean up completed promise
-          this.activeProcessingPromises.delete(urlHash);
-        });
-
-        // Track the processing promise
-        this.activeProcessingPromises.set(urlHash, processingPromise);
-
-        logger.info(`🔄 Started background processing for: ${pageData.url}`, {
-          activeProcessing: this.activeProcessingPromises.size,
-          queueRemaining: this.session.pageQueue.length,
-        });
-
-        // Small delay to prevent overwhelming the system
-        await new Promise((resolve) => setTimeout(resolve, 1000));
-      } else {
-        // No more queued pages, check if all processing is complete
-        if (this.activeProcessingPromises.size === 0) {
-          // All pages have been processed
-          const allPagesCompleted = this.areAllPagesCompleted();
-          if (allPagesCompleted) {
-            logger.info("✅ All pages completed in exploration mode");
-            return await this.finalizeSession(false);
-          } else {
-            // Wait a bit and check again (some pages might still be processing)
-            await new Promise((resolve) => setTimeout(resolve, 2000));
-          }
-        } else {
-          // Wait for some processing to complete
-          logger.info(`⏳ Waiting for background processing to complete...`, {
-            activeProcessing: this.activeProcessingPromises.size,
-          });
-          await new Promise((resolve) => setTimeout(resolve, 3000));
-        }
-      }
-    }
-  }
-
-  /**
-   * Wait for all active processing to complete
-   */
-  private async waitForAllProcessingToComplete(): Promise<void> {
-    if (this.activeProcessingPromises.size > 0) {
-      logger.info(
-        `⏳ Waiting for ${this.activeProcessingPromises.size} background processes to complete...`
-      );
-      await Promise.allSettled(
-        Array.from(this.activeProcessingPromises.values())
-      );
-      this.activeProcessingPromises.clear();
-    }
   }
 
   /**
@@ -957,96 +855,6 @@ export class WebExplorer {
           error instanceof Error ? error.message : String(error)
         }`,
       };
-    }
-  }
-
-  private async toolPageExtract(instruction: string): Promise<any> {
-    console.log(`🔍 Extracting: ${instruction}`);
-    try {
-      // Enhanced schema for more comprehensive analysis
-      const extractSchema = z.object({
-        extracted_data: z
-          .string()
-          .describe(
-            "Comprehensive analysis of the page content, features, and functionality. Focus on business value, user experience patterns, technical capabilities, and strategic insights rather than just listing visible elements. Analyze what you see in context of the overall platform strategy."
-          ),
-        elements_found: z
-          .array(z.string())
-          .describe(
-            "Key functional elements and features that indicate platform capabilities and user experience design"
-          ),
-        page_structure: z
-          .string()
-          .describe(
-            "Analysis of page architecture, information hierarchy, and UX design patterns used"
-          ),
-        interactive_elements: z
-          .array(z.string())
-          .describe(
-            "Interactive features and their strategic purpose in the user journey and conversion funnel"
-          ),
-        business_insights: z
-          .string()
-          .describe(
-            "Business model indicators, monetization clues, competitive positioning signals, and strategic market approach evident on this page"
-          ),
-        technical_observations: z
-          .string()
-          .describe(
-            "Technical architecture insights, scalability indicators, integration capabilities, and platform sophistication level"
-          ),
-      });
-
-      // Enhanced instruction to get better analytical data
-      const enhancedInstruction = `${instruction}
-
-ANALYSIS APPROACH: Act as a senior product manager analyzing this platform. Focus on:
-1. Business strategy and value proposition signals
-2. User experience design patterns and conversion optimization
-3. Technical architecture and capability indicators  
-4. Competitive positioning and market approach
-5. Revenue model and monetization strategy clues
-6. Growth and user acquisition tactics
-
-Provide comprehensive insights rather than just listing visible elements. Analyze WHY features exist and HOW they contribute to the platform's business objectives.`;
-
-      console.log(
-        `🔧 Calling stagehand.page.extract with enhanced instruction`
-      );
-
-      const result = await this.stagehand.page.extract({
-        instruction: enhancedInstruction,
-        schema: extractSchema,
-      });
-
-      console.log(`✅ Extract succeeded:`, result);
-      return { success: true, data: result };
-    } catch (error) {
-      console.error(`❌ Extract failed with error:`, error);
-      console.error(`❌ Error type:`, typeof error);
-      console.error(
-        `❌ Error message:`,
-        error instanceof Error ? error.message : String(error)
-      );
-      console.error(
-        `❌ Error stack:`,
-        error instanceof Error ? error.stack : "No stack trace"
-      );
-
-      // Fallback to simple string extraction
-      try {
-        const fallbackResult = await this.stagehand.page.extract({
-          instruction,
-          schema: z.object({ data: z.string() }),
-        });
-        return { success: true, data: fallbackResult };
-      } catch (fallbackError) {
-        return {
-          error: `Extraction failed: ${
-            error instanceof Error ? error.message : String(error)
-          }`,
-        };
-      }
     }
   }
 
@@ -2133,12 +1941,7 @@ Provide comprehensive insights rather than just listing visible elements. Analyz
           queueSize: this.session.pageQueue.length,
         });
 
-        // Resume exploration based on mode
-        if (this.isExplorationObjective) {
-          await this.exploreWithBackgroundProcessing();
-        } else {
-          await this.exploreSequentially();
-        }
+        await this.exploreSequentially();
       } else {
         logger.info(`✅ No more pages to explore, ready for new chat messages`);
       }
