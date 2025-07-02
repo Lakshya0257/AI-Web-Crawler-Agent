@@ -802,7 +802,8 @@ export class WebExplorer {
    * Returns { newUrl: string | null, actionResult: any }
    */
   private async executeActionAndCheckUrlChange(
-    instruction: string
+    instruction: string,
+    urlHash: string
   ): Promise<{ newUrl: string | null; actionResult: any }> {
     // Store the current URL before executing action
     const originalUrl = this.normalizeUrl(this.page.url());
@@ -832,8 +833,21 @@ export class WebExplorer {
     const newUrl = this.normalizeUrl(this.page.url());
     const urlChanged = newUrl !== originalUrl;
 
+    const afterActionScreenshot = await this.page.screenshot({
+      fullPage: false,
+    });
+
     if (urlChanged) {
       logger.info(`🔄 URL changed: ${originalUrl} → ${newUrl}`);
+
+      
+
+      this.globalStore.addAction(
+        urlHash,
+        instruction,
+        `data:image/png;base64,${afterActionScreenshot.toString("base64")}`,
+        this.session.globalStepCounter
+      );
 
       // Check if we're in a sensitive flow (login, signup, etc.)
       if (this.session.flowContext.isInSensitiveFlow) {
@@ -856,6 +870,12 @@ export class WebExplorer {
         return { newUrl: newUrl, actionResult: actResult };
       }
     } else {
+      this.globalStore.addAction(
+        urlHash,
+        instruction,
+        `data:image/png;base64,${afterActionScreenshot.toString("base64")}`,
+        this.session.globalStepCounter
+      );
       // URL didn't change, don't reload, just return the result
       logger.debug(`✅ URL remained the same: ${originalUrl}`);
       return { newUrl: null, actionResult: actResult };
@@ -878,9 +898,9 @@ export class WebExplorer {
 
       const agent = this.stagehand.agent({
         // You can use either OpenAI or Anthropic
-        provider: "openai",
+        provider: "anthropic",
         // The model to use (claude-3-7-sonnet-latest for Anthropic)
-        model: "computer-use-preview",
+        model: "claude-3-7-sonnet-latest",
 
         // Customize the system prompt
         instructions: `You are a helpful assistant that can use a web browser.
@@ -888,7 +908,7 @@ export class WebExplorer {
 
         // Customize the API key
         options: {
-          apiKey: process.env.OPENAI_API_KEY,
+          apiKey: process.env.ANTHROPIC_API_KEY,
         },
       });
 
@@ -1406,7 +1426,7 @@ Provide comprehensive insights rather than just listing visible elements. Analyz
       switch (toolName) {
         case "page_act":
           const actionResult =
-            await this.executeActionAndCheckUrlChange(instruction);
+            await this.executeActionAndCheckUrlChange(instruction, pageData.urlHash);
 
           // Check if user is still active after tool execution
           if (!this.isUserStillActive()) {
@@ -1440,18 +1460,18 @@ Provide comprehensive insights rather than just listing visible elements. Analyz
 
             // 🚀 AUTOMATIC PAGE NAVIGATION GRAPH GENERATION
             // When URL changes, automatically generate graph with page navigation relationship
-            this.generatePageNavigationGraph(
-              pageData.urlHash,
-              instruction,
-              pageData.url,
-              discoveredUrl
-            ).catch((error) => {
-              logger.error("❌ Failed to generate page navigation graph", {
-                error,
-                sourceUrl: pageData.url,
-                targetUrl: discoveredUrl,
-              });
-            });
+            // this.generatePageNavigationGraph(
+            //   pageData.urlHash,
+            //   instruction,
+            //   pageData.url,
+            //   discoveredUrl
+            // ).catch((error: any) => {
+            //   logger.error("❌ Failed to generate page navigation graph", {
+            //     error,
+            //     sourceUrl: pageData.url,
+            //     targetUrl: discoveredUrl,
+            //   });
+            // });
 
             // Check if we're in a sensitive flow (login, signup, etc.)
             if (this.session.flowContext.isInSensitiveFlow) {
@@ -1481,40 +1501,14 @@ Provide comprehensive insights rather than just listing visible elements. Analyz
             step.result = `PREVIOUS_ACTION_RESULT: URL_CHANGED=false, STAYED_ON_SAME_PAGE=true, ACTION_RESULT=${toolResult.success ? "SUCCESS" : "FAILED"}`;
           }
 
-          // 🆕 GlobalStore Integration: Add action to GlobalStore if URL didn't change
-          if (!discoveredUrl && toolResult.success) {
-            // Take after-action screenshot
-            const afterActionScreenshot = await this.page.screenshot({
-              fullPage: false,
+          this.startGraphGenerationFlow(
+            pageData.urlHash
+          ).catch((error) => {
+            logger.error("❌ Background graph generation failed", {
+              error,
+              urlHash: pageData.urlHash,
             });
-            const afterActionScreenshotPath = this.fileManager.saveScreenshot(
-              pageData.urlHash,
-              this.session.globalStepCounter,
-              "after_page_act",
-              afterActionScreenshot
-            );
-
-            // Store action in GlobalStore
-            this.globalStore.addAction(
-              pageData.urlHash,
-              instruction,
-              `data:image/png;base64,${afterActionScreenshot.toString("base64")}`,
-              this.session.globalStepCounter
-            );
-
-            // 🚀 NON-BLOCKING GRAPH GENERATION FLOW
-            // Note: Don't await these calls - they run in the background
-            this.startGraphGenerationFlow(
-              pageData.urlHash,
-              instruction,
-              `data:image/png;base64,${afterActionScreenshot.toString("base64")}`
-            ).catch((error) => {
-              logger.error("❌ Background graph generation failed", {
-                error,
-                urlHash: pageData.urlHash,
-              });
-            });
-          }
+          });
 
           // Emit specific page_act event
           if (this.socket && this.userName) {
@@ -1927,13 +1921,16 @@ Provide comprehensive insights rather than just listing visible elements. Analyz
 
       const currentGraph = sourcePageStore.graph;
 
-      // Directly call Claude to generate updated graph with navigation relationship
-      const updatedGraph = await this.llmClient.generatePageNavigationGraph(
+      // Use unified graph generation for page navigation
+      const updatedGraph = await this.llmClient.generateUnifiedInteractionGraph(
         sourcePageStore,
         currentGraph,
-        navigationAction,
-        sourceUrl,
-        targetUrl
+        {
+          isPageNavigation: true,
+          navigationAction,
+          sourceUrl,
+          targetUrl,
+        }
       );
 
       if (updatedGraph) {
@@ -1976,8 +1973,6 @@ Provide comprehensive insights rather than just listing visible elements. Analyz
    */
   private async startGraphGenerationFlow(
     urlHash: string,
-    latestAction: string,
-    latestScreenshot: string
   ): Promise<void> {
     try {
       // Step 1: Emit "updating graph" event
@@ -1990,23 +1985,12 @@ Provide comprehensive insights rather than just listing visible elements. Analyz
         return;
       }
 
-      // Step 3: Ask Gemini if graph needs updating
+      // Always update graph after page_act
       const currentGraph = pageStore.graph;
-      const shouldUpdate = await this.llmClient.shouldUpdateGraph(
-        pageStore,
-        currentGraph,
-        latestAction,
-        latestScreenshot
-      );
 
-      if (!shouldUpdate) {
-        logger.info(`📊 Graph update not needed for: ${pageStore.url}`);
-        return;
-      }
-
-      // Step 4: Generate new graph with Claude
+      // Generate new graph with unified method
       logger.info(`📊 Generating interaction graph for: ${pageStore.url}`);
-      const newGraph = await this.llmClient.generateInteractionGraph(
+      const newGraph = await this.llmClient.generateUnifiedInteractionGraph(
         pageStore,
         currentGraph
       );

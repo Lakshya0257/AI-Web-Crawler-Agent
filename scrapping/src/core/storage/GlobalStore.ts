@@ -6,16 +6,54 @@ import type { Socket } from "socket.io";
 export interface ActionHistoryEntry {
   instruction: string;
   after_act: string; // Screenshot path or base64
+  imageName: string; // Unique name for the image node (step_X_hash_Y)
   timestamp: string;
   stepNumber: number;
 }
 
 export interface InteractionGraph {
-  nodes: GraphNode[];
-  edges: GraphEdge[];
+  nodes: ImageNode[];
+  edges: ImageEdge[];
+  flows: FlowDefinition[];
   description: string;
   pageSummary: string;
   lastUpdated: string;
+}
+
+export interface ImageNode {
+  id: string; // imageName (step_X_hash_Y)
+  imageName: string; // Same as id for consistency
+  imageData: string; // Base64 screenshot data
+  instruction: string; // The action that led to this state
+  stepNumber: number; // Step number when this state was captured
+  metadata: {
+    visibleElements: string[]; // Description of what's visible
+    clickableElements: string[]; // Description of interactive elements
+    flowsConnected: string[]; // Array of flow IDs this image participates in
+    dialogsOpen: string[]; // Any dialogs/modals open
+    pageTitle?: string; // Page title if available
+    timestamp: string; // When this state was captured
+  };
+  position?: { x: number; y: number }; // For frontend positioning
+}
+
+export interface ImageEdge {
+  from: string; // Source imageName
+  to: string; // Target imageName
+  action: string; // Specific action taken (e.g., "click_upload_button")
+  instruction: string; // Full instruction that caused the transition
+  description: string; // Human-readable description of the transition
+  flowId?: string; // Optional flow this edge belongs to
+}
+
+export interface FlowDefinition {
+  id: string; // Unique flow identifier
+  name: string; // Human-readable flow name (e.g., "Upload Asset Flow")
+  description: string; // What this flow accomplishes
+  startImageName: string; // Initial state of the flow
+  endImageNames: string[]; // Possible end states
+  imageNodes: string[]; // All image nodes in this flow
+  flowType: "linear" | "branching" | "circular"; // Flow pattern type
 }
 
 export interface GraphNode {
@@ -91,9 +129,14 @@ export class GlobalStore {
       return;
     }
 
+    // Generate unique image name: step_X_hash_Y
+    const imageHash = this.generateImageHash(afterActScreenshot);
+    const imageName = `step_${stepNumber}_${imageHash}`;
+
     const actionEntry: ActionHistoryEntry = {
       instruction,
       after_act: afterActScreenshot,
+      imageName,
       timestamp: new Date().toISOString(),
       stepNumber
     };
@@ -105,8 +148,24 @@ export class GlobalStore {
     logger.info(`📝 Added action to page store`, {
       urlHash,
       instruction: instruction.substring(0, 50),
+      imageName,
       totalActions: pageStore.actionHistory.length
     });
+  }
+
+  /**
+   * Generate a short hash from image data for unique naming
+   */
+  private generateImageHash(imageData: string): string {
+    // Simple hash generation from image data
+    let hash = 0;
+    const str = imageData.substring(0, 1000); // Use first 1000 chars for hash
+    for (let i = 0; i < str.length; i++) {
+      const char = str.charCodeAt(i);
+      hash = ((hash << 5) - hash) + char;
+      hash = hash & hash; // Convert to 32-bit integer
+    }
+    return Math.abs(hash).toString(16).substring(0, 8); // 8 character hex hash
   }
 
   /**

@@ -1,4 +1,4 @@
-import React, { useCallback, useMemo } from 'react';
+import React, { useCallback, useMemo, useState } from 'react';
 import {
   ReactFlow,
   addEdge,
@@ -24,9 +24,10 @@ import { Badge } from './badge';
 import { Button } from './button';
 import { 
   Network, MousePointer, Link2, ToggleLeft, FileText, 
-  Square, Circle, Globe, Info, ZoomIn, ZoomOut, Maximize 
+  Square, Circle, Globe, Info, ZoomIn, ZoomOut, Maximize,
+  Play, Pause, RotateCcw, Eye, EyeOff
 } from 'lucide-react';
-import type { InteractionGraph, GraphNode as GraphNodeType, GraphEdge, GraphNode } from '../../types/exploration';
+import type { InteractionGraph, ImageNode, ImageEdge, FlowDefinition } from '../../types/exploration';
 import { Separator } from './separator';
 
 interface NetworkGraphProps {
@@ -34,51 +35,42 @@ interface NetworkGraphProps {
   className?: string;
 }
 
-const getNodeColor = (type: string) => {
-  switch (type) {
-    case 'button': return { bg: '#3b82f6', border: '#2563eb', text: '#ffffff' };
-    case 'link': return { bg: '#22c55e', border: '#16a34a', text: '#ffffff' };
-    case 'input': return { bg: '#a855f7', border: '#9333ea', text: '#ffffff' };
-    case 'dropdown': return { bg: '#f97316', border: '#ea580c', text: '#ffffff' };
-    case 'toggle': return { bg: '#ec4899', border: '#db2777', text: '#ffffff' };
-    case 'tab': return { bg: '#6366f1', border: '#4f46e5', text: '#ffffff' };
-    case 'section': return { bg: '#6b7280', border: '#4b5563', text: '#ffffff' };
-    case 'dialog': return { bg: '#f59e0b', border: '#d97706', text: '#ffffff' };
-    case 'state': return { bg: '#14b8a6', border: '#0d9488', text: '#ffffff' };
-    case 'navigation_target': return { bg: '#ef4444', border: '#dc2626', text: '#ffffff' };
+const getFlowColor = (flowType: string) => {
+  switch (flowType) {
+    case 'linear': return { bg: '#3b82f6', border: '#2563eb', text: '#ffffff' };
+    case 'branching': return { bg: '#22c55e', border: '#16a34a', text: '#ffffff' };
+    case 'circular': return { bg: '#f97316', border: '#ea580c', text: '#ffffff' };
     default: return { bg: '#6b7280', border: '#4b5563', text: '#ffffff' };
   }
 };
 
-const getNodeIcon = (type: string) => {
-  switch (type) {
-    case 'button': return '🔘';
-    case 'link': return '🔗';
-    case 'input': return '📝';
-    case 'dropdown': return '📋';
-    case 'toggle': return '🔄';
-    case 'tab': return '📑';
-    case 'dialog': return '💬';
-    case 'state': return '⚙️';
-    case 'section': return '📦';
-    case 'navigation_target': return '🎯';
-    default: return '⚪';
+const getFlowIcon = (flowType: string) => {
+  switch (flowType) {
+    case 'linear': return '➡️';
+    case 'branching': return '🔀';
+    case 'circular': return '🔄';
+    default: return '🔗';
   }
 };
 
-// Custom Node Component with Handles
-const CustomNode = ({ data, isConnectable }: {
-  data: GraphNode;
+// Custom Image Node Component
+const ImageNode = ({ data, isConnectable }: {
+  data: ImageNode;
   isConnectable: boolean
 }) => {
-  const colors = getNodeColor(data.type);
+  const [imageError, setImageError] = useState(false);
+  const [showDetails, setShowDetails] = useState(false);
   
+  const formatTime = (timestamp: string): string => {
+    return new Date(timestamp).toLocaleTimeString();
+  };
+
   return (
     <div 
-      className="relative"
+      className="relative group"
       style={{ 
-        minWidth: '180px',
-        maxWidth: '220px'
+        minWidth: '200px',
+        maxWidth: '300px'
       }}
     >
       <Handle
@@ -86,52 +78,122 @@ const CustomNode = ({ data, isConnectable }: {
         position={Position.Top}
         isConnectable={isConnectable}
         style={{
-          background: colors.border,
-          width: 8,
-          height: 8,
+          background: '#3b82f6',
+          width: 10,
+          height: 10,
           border: '2px solid #fff'
         }}
       />
       
-      <div 
-        className="px-4 py-3 shadow-lg rounded-lg border-2 transition-all hover:shadow-xl"
-        style={{ 
-          borderColor: colors.border,
-          backgroundColor: colors.bg,
-          color: colors.text
-        }}
-      >
-        <div className="flex items-center gap-2 mb-1">
-          <span className="text-lg">{getNodeIcon(data.type)}</span>
-          <div className="font-bold text-sm truncate" style={{ color: colors.text }}>
-            {data.label}
+      <Card className="shadow-lg hover:shadow-xl transition-all border-2 border-blue-200 hover:border-blue-400">
+        <CardHeader className="p-3 pb-2">
+          <div className="flex items-center justify-between">
+            <Badge variant="secondary" className="text-xs">
+              Step {data.stepNumber}
+            </Badge>
+            <Button 
+              variant="ghost" 
+              size="sm" 
+              className="h-6 w-6 p-0"
+              onClick={() => setShowDetails(!showDetails)}
+            >
+              {showDetails ? <EyeOff className="h-3 w-3" /> : <Eye className="h-3 w-3" />}
+            </Button>
           </div>
-        </div>
-        <div className="text-xs opacity-90 leading-relaxed">
-          {data.description}
-        </div>
-        <div className="mt-2">
-          <Badge 
-            className="text-xs px-2 py-0"
-            style={{ 
-              backgroundColor: 'rgba(255,255,255,0.2)',
-              color: colors.text,
-              borderColor: 'rgba(255,255,255,0.3)'
-            }}
-          >
-            {data.type}
-          </Badge>
-        </div>
-      </div>
+          <CardTitle className="text-sm font-semibold text-gray-800 leading-tight">
+            {data.instruction}
+          </CardTitle>
+        </CardHeader>
+        
+        <CardContent className="p-3 pt-0">
+          {/* Screenshot Image */}
+          <div className="relative mb-3 rounded-lg overflow-hidden border border-gray-200">
+            {!imageError ? (
+              <img 
+                src={data.imageData}
+                alt={`Screenshot for ${data.instruction}`}
+                className="w-full h-32 object-cover object-top hover:h-48 transition-all duration-300"
+                onError={() => setImageError(true)}
+                style={{ maxHeight: showDetails ? '200px' : '128px' }}
+              />
+            ) : (
+              <div className="w-full h-32 bg-gray-100 flex items-center justify-center text-gray-500">
+                <div className="text-center">
+                  <Square className="h-8 w-8 mx-auto mb-2" />
+                  <span className="text-xs">Image unavailable</span>
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* Flow Badges */}
+          <div className="flex flex-wrap gap-1 mb-2">
+            {(data.metadata?.flowsConnected || []).map((flowId) => (
+              <Badge 
+                key={flowId} 
+                variant="outline" 
+                className="text-xs px-2 py-0 bg-blue-50 text-blue-700 border-blue-200"
+              >
+                {flowId.replace('_', ' ')}
+              </Badge>
+            ))}
+          </div>
+
+          {/* Detailed Information */}
+          {showDetails && (
+            <div className="space-y-2 text-xs text-gray-600">
+              <Separator />
+              
+              <div>
+                <strong>Time:</strong> {formatTime(data.metadata?.timestamp || new Date().toISOString())}
+              </div>
+              
+              {(data.metadata?.dialogsOpen || []).length > 0 && (
+                <div>
+                  <strong>Dialogs:</strong> {(data.metadata?.dialogsOpen || []).join(', ')}
+                </div>
+              )}
+              
+              <div>
+                <strong>Visible Elements:</strong>
+                <div className="mt-1 max-h-20 overflow-y-auto">
+                  {(data.metadata?.visibleElements || []).slice(0, 3).map((element, idx) => (
+                    <div key={idx} className="text-xs text-gray-500">• {element}</div>
+                  ))}
+                  {(data.metadata?.visibleElements || []).length > 3 && (
+                    <div className="text-xs text-gray-400">
+                      +{(data.metadata?.visibleElements || []).length - 3} more...
+                    </div>
+                  )}
+                </div>
+              </div>
+              
+              <div>
+                <strong>Interactive:</strong>
+                <div className="mt-1 max-h-16 overflow-y-auto">
+                  {(data.metadata?.clickableElements || []).slice(0, 2).map((element, idx) => (
+                    <div key={idx} className="text-xs text-gray-500">• {element}</div>
+                  ))}
+                  {(data.metadata?.clickableElements || []).length > 2 && (
+                    <div className="text-xs text-gray-400">
+                      +{(data.metadata?.clickableElements || []).length - 2} more...
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+          )}
+        </CardContent>
+      </Card>
       
       <Handle
         type="source"
         position={Position.Bottom}
         isConnectable={isConnectable}
         style={{
-          background: colors.border,
-          width: 8,
-          height: 8,
+          background: '#3b82f6',
+          width: 10,
+          height: 10,
           border: '2px solid #fff'
         }}
       />
@@ -140,244 +202,233 @@ const CustomNode = ({ data, isConnectable }: {
 };
 
 const nodeTypes = {
-  custom: CustomNode,
+  imageNode: ImageNode,
 };
 
-// Edge label component
-const EdgeLabel = ({ label }: { label: string }) => (
-  <div className="px-2 py-1 bg-white rounded-md shadow-md border border-gray-200">
-    <span className="text-xs font-medium text-gray-700">{label}</span>
+// Edge label component with action information
+const ActionEdgeLabel = ({ label, instruction }: { label: string; instruction: string }) => (
+  <div className="px-2 py-1 bg-white rounded-md shadow-md border border-gray-200 max-w-40">
+    <div className="text-xs font-medium text-gray-700 truncate">{label}</div>
+    <div className="text-xs text-gray-500 truncate">{instruction}</div>
   </div>
 );
 
 export function NetworkGraph({ graph, className = '' }: NetworkGraphProps) {
+  const [selectedFlow, setSelectedFlow] = useState<string | null>(null);
+  const [showAllFlows, setShowAllFlows] = useState(true);
+
+  console.log('Graph Data:', graph);
+
   const formatTime = (timestamp: string): string => {
     return new Date(timestamp).toLocaleTimeString();
   };
 
-  // Convert graph data to React Flow format with proper layout
+  // Convert graph data to React Flow format with flow-based layout
   const { nodes: initialNodes, edges: initialEdges } = useMemo(() => {
-    // Calculate layout positions
-    const nodesByType: { [key: string]: GraphNodeType[] } = {};
+    // Group nodes by flows for better layout
+    const flowGroups: { [flowId: string]: ImageNode[] } = {};
+    const unassignedNodes: ImageNode[] = [];
+
     graph.nodes.forEach(node => {
-      if (!nodesByType[node.type]) {
-        nodesByType[node.type] = [];
-      }
-      nodesByType[node.type].push(node);
-    });
-
-    // Create nodes with better positioning
-    const nodes: Node[] = [];
-    let yOffset = 0;
-    
-    Object.entries(nodesByType).forEach(([type, typeNodes]) => {
-      typeNodes.forEach((node, index) => {
-        const xOffset = (index % 3) * 300 + 100;
-        const yPos = yOffset + Math.floor(index / 3) * 200;
-        
-        nodes.push({
-          id: node.id,
-          type: 'custom',
-          position: node.position || { x: xOffset, y: yPos },
-          data: {
-            label: node.label,
-            description: node.description,
-            type: node.type,
-            actionable: node.actionable,
-          },
-          draggable: true,
+      if ((node.metadata?.flowsConnected || []).length > 0) {
+        (node.metadata?.flowsConnected || []).forEach(flowId => {
+          if (!flowGroups[flowId]) {
+            flowGroups[flowId] = [];
+          }
+          flowGroups[flowId].push(node);
         });
-      });
-      yOffset += Math.ceil(typeNodes.length / 3) * 200 + 100;
+      } else {
+        unassignedNodes.push(node);
+      }
     });
 
-    // Create edges with proper configuration
-    const edges: Edge[] = graph.edges.map((edge: GraphEdge, index: number) => ({
-      id: `${edge.from}-${edge.to}-${index}`,
-      source: edge.from,
-      target: edge.to,
-      type: 'smoothstep',
-      animated: true,
-      label: edge.action,
-      labelStyle: { 
-        fontSize: 11, 
-        fontWeight: 600,
-        fill: '#374151',
-        backgroundColor: 'white',
-        padding: '2px 6px',
-        borderRadius: '4px',
-        border: '1px solid #e5e7eb'
-      },
-      labelBgStyle: {
-        fill: 'white',
-        fillOpacity: 0.9
-      },
-      style: { 
-        stroke: '#3b82f6', 
-        strokeWidth: 2
-      },
-      markerEnd: {
-        type: MarkerType.ArrowClosed,
-        color: '#3b82f6',
-        width: 20,
-        height: 20
-      },
-    }));
+    // Create nodes with flow-based positioning
+    const nodes: Node[] = [];
+    let flowYOffset = 0;
+    
+    // Position nodes by flow
+    Object.entries(flowGroups).forEach(([flowId, flowNodes]) => {
+      const flow = graph.flows?.find(f => f.id === flowId);
+      const isSelectedFlow = selectedFlow === flowId || showAllFlows;
+      
+      if (!isSelectedFlow) return;
+
+      flowNodes.forEach((node, index) => {
+        const xOffset = index * 350 + 100;
+        const yPos = flowYOffset + 50;
+        
+                 nodes.push({
+           id: node.id,
+           type: 'imageNode',
+           position: node.position || { x: xOffset, y: yPos },
+           data: node as any,
+           draggable: true,
+           hidden: !isSelectedFlow,
+         });
+      });
+      
+      flowYOffset += 400; // Space between flows
+    });
+
+    // Add unassigned nodes
+    if (unassignedNodes.length > 0 && (selectedFlow === null || showAllFlows)) {
+      unassignedNodes.forEach((node, index) => {
+        const xOffset = (index % 4) * 350 + 100;
+        const yPos = flowYOffset + Math.floor(index / 4) * 300 + 50;
+        
+                 nodes.push({
+           id: node.id,
+           type: 'imageNode',
+           position: node.position || { x: xOffset, y: yPos },
+           data: node as any,
+           draggable: true,
+         });
+      });
+    }
+
+    // Create edges with flow filtering
+    const edges: Edge[] = graph.edges
+      .filter(edge => {
+        if (showAllFlows) return true;
+        if (!selectedFlow) return true;
+        return edge.flowId === selectedFlow;
+      })
+      .map((edge: ImageEdge, index: number) => ({
+        id: `${edge.from}-${edge.to}-${index}`,
+        source: edge.from,
+        target: edge.to,
+        type: 'smoothstep',
+        animated: true,
+        style: { 
+          stroke: edge.flowId ? getFlowColor(
+            graph.flows?.find(f => f.id === edge.flowId)?.flowType || 'linear'
+          ).border : '#6b7280',
+          strokeWidth: 2
+        },
+        markerEnd: {
+          type: MarkerType.ArrowClosed,
+          color: edge.flowId ? getFlowColor(
+            graph.flows?.find(f => f.id === edge.flowId)?.flowType || 'linear'
+          ).border : '#6b7280',
+        },
+        label: edge.action,
+        labelStyle: { fontSize: 12, fontWeight: 600 },
+        labelBgPadding: [8, 4],
+        labelBgBorderRadius: 4,
+        labelBgStyle: { fill: '#ffffff', fillOpacity: 0.9 },
+      }));
 
     return { nodes, edges };
-  }, [graph]);
+  }, [graph, selectedFlow, showAllFlows]);
 
   const [nodes, setNodes, onNodesChange] = useNodesState(initialNodes);
   const [edges, setEdges, onEdgesChange] = useEdgesState(initialEdges);
 
-  const onConnect = useCallback(
-    (params: any) => setEdges((eds) => addEdge({ ...params, animated: true }, eds)),
-    [setEdges],
-  );
-
-  // Re-initialize nodes and edges when graph changes
+  // Update nodes and edges when graph or flow selection changes
   React.useEffect(() => {
     setNodes(initialNodes);
     setEdges(initialEdges);
   }, [initialNodes, initialEdges, setNodes, setEdges]);
 
   return (
-    <div className={`space-y-4 ${className}`}>
-      {/* Graph Info Header */}
-      <Card>
-        <CardHeader className="pb-3">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-2">
-              <Globe className="w-4 h-4 text-primary" />
-              <CardTitle className="text-sm">Page Interaction Flow</CardTitle>
+    <div className={`h-full w-full ${className}`}>
+      <ReactFlow
+        nodes={nodes}
+        edges={edges}
+        onNodesChange={onNodesChange}
+        onEdgesChange={onEdgesChange}
+        nodeTypes={nodeTypes}
+        connectionLineType={ConnectionLineType.SmoothStep}
+        fitView
+        attributionPosition="bottom-left"
+      >
+        <Background variant={BackgroundVariant.Dots} gap={20} size={1} />
+        <Controls />
+        <MiniMap 
+          nodeStrokeColor="#3b82f6"
+          nodeColor="#e2e8f0"
+          nodeBorderRadius={8}
+          style={{ background: '#f8fafc' }}
+        />
+        
+        {/* Flow Control Panel */}
+        <Panel position="top-right" className="bg-white/95 backdrop-blur-sm rounded-lg shadow-lg border p-4 max-w-80">
+          <div className="space-y-3">
+            <div className="flex items-center justify-between">
+              <h3 className="font-semibold text-sm">Visual Flow Diagram</h3>
+              <Badge variant="secondary">{graph.nodes.length} states</Badge>
             </div>
-            <Badge variant="outline" className="text-xs">
-              Updated {formatTime(graph.lastUpdated)}
-            </Badge>
-          </div>
-        </CardHeader>
-        <CardContent>
-          <div className="grid grid-cols-3 gap-4 text-xs">
-            <div>
-              <p className="font-medium mb-1">Elements</p>
-              <p className="text-muted-foreground">{graph.nodes.length} components</p>
-            </div>
-            <div>
-              <p className="font-medium mb-1">Connections</p>
-              <p className="text-muted-foreground">{graph.edges.length} relationships</p>
-            </div>
-            <div>
-              <p className="font-medium mb-1">Page URL</p>
-              <p className="text-muted-foreground truncate">{graph.pageUrl || 'N/A'}</p>
-            </div>
-          </div>
-        </CardContent>
-      </Card>
-
-      {/* Network Graph */}
-      <Card className="overflow-hidden">
-        <CardHeader className="pb-2">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-2">
-              <Network className="w-4 h-4" />
-              <CardTitle className="text-sm">Interactive Network Map</CardTitle>
-            </div>
-            <div className="text-xs text-muted-foreground">
-              Drag to pan • Scroll to zoom • Click and drag nodes
-            </div>
-          </div>
-        </CardHeader>
-        <CardContent className="p-0">
-          <div className="h-[600px] border-t">
-            <ReactFlow
-              nodes={nodes}
-              edges={edges}
-              onNodesChange={onNodesChange}
-              onEdgesChange={onEdgesChange}
-              onConnect={onConnect}
-              nodeTypes={nodeTypes}
-              connectionLineType={ConnectionLineType.SmoothStep}
-              fitView
-              fitViewOptions={{
-                padding: 0.2,
-                includeHiddenNodes: false,
-                minZoom: 0.5,
-                maxZoom: 1.5
-              }}
-              minZoom={0.3}
-              maxZoom={2}
-              defaultViewport={{ x: 0, y: 0, zoom: 0.8 }}
-              proOptions={{ hideAttribution: true }}
-            >
-              <Background 
-                variant={BackgroundVariant.Dots} 
-                gap={20} 
-                size={1}
-                color="#e5e7eb"
-              />
-              <Controls 
-                className="bg-white border border-gray-200 rounded-lg shadow-md"
-                showInteractive={false}
-              />
-              <MiniMap 
-                className="bg-white border border-gray-200 rounded-lg shadow-md"
-                maskColor="rgba(0, 0, 0, 0.1)"
-                // @ts-ignore
-                nodeColor={(node) => getNodeColor(node.data["type"] || 'default').bg}
-                pannable
-                zoomable
-              />
+            
+            <Separator />
+            
+            {/* Flow Filter Controls */}
+            <div className="space-y-2">
+              <div className="flex items-center justify-between">
+                <span className="text-sm font-medium">Flows</span>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => setShowAllFlows(!showAllFlows)}
+                  className="h-7 px-2"
+                >
+                  {showAllFlows ? 'Filter' : 'Show All'}
+                </Button>
+              </div>
               
-              {/* Legend Panel */}
-              <Panel position="top-right" className="bg-white/95 backdrop-blur p-3 rounded-lg border border-gray-200 shadow-md">
-                <div className="space-y-2">
-                  <div className="font-medium text-xs mb-2">Element Types:</div>
-                  <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs">
-                    {[
-                      { icon: '🔘', label: 'Button', type: 'button' },
-                      { icon: '🔗', label: 'Link', type: 'link' },
-                      { icon: '📝', label: 'Input', type: 'input' },
-                      { icon: '📋', label: 'Dropdown', type: 'dropdown' },
-                      { icon: '💬', label: 'Dialog', type: 'dialog' },
-                      { icon: '⚙️', label: 'State', type: 'state' },
-                    ].map(item => (
-                      <div key={item.type} className="flex items-center gap-1.5">
-                        <span>{item.icon}</span>
-                        <span>{item.label}</span>
-                      </div>
-                    ))}
-                  </div>
+              {graph.flows && graph.flows.length > 0 ? (
+                <div className="space-y-1 max-h-40 overflow-y-auto">
+                  {graph.flows.map((flow) => {
+                    const colors = getFlowColor(flow.flowType);
+                    const isSelected = selectedFlow === flow.id;
+                    
+                    return (
+                      <Button
+                        key={flow.id}
+                        variant={isSelected ? "default" : "ghost"}
+                        size="sm"
+                        className="w-full justify-start h-8 px-2"
+                        style={isSelected ? { backgroundColor: colors.bg, borderColor: colors.border } : {}}
+                        onClick={() => setSelectedFlow(isSelected ? null : flow.id)}
+                      >
+                        <span className="mr-2">{getFlowIcon(flow.flowType)}</span>
+                        <div className="flex flex-col items-start flex-1 min-w-0">
+                          <span className="text-xs font-medium truncate w-full">
+                            {flow.name}
+                          </span>
+                          <span className="text-xs opacity-70 truncate w-full">
+                            {flow.imageNodes.length} states
+                          </span>
+                        </div>
+                      </Button>
+                    );
+                  })}
                 </div>
-              </Panel>
-            </ReactFlow>
+              ) : (
+                <div className="text-xs text-gray-500 text-center py-2">
+                  No flows detected yet
+                </div>
+              )}
+            </div>
+            
+            <Separator />
+            
+            {/* Summary Information */}
+            <div className="text-xs text-gray-600 space-y-1">
+              <div>
+                <strong>Last Updated:</strong> {formatTime(graph.lastUpdated)}
+              </div>
+              {graph.flows && (
+                <div>
+                  <strong>Total Flows:</strong> {graph.flows.length}
+                </div>
+              )}
+              <div>
+                <strong>Connections:</strong> {graph.edges.length}
+              </div>
+            </div>
           </div>
-        </CardContent>
-      </Card>
-
-      {/* Page Summary */}
-      <Card>
-        <CardHeader className="pb-3">
-          <div className="flex items-center gap-2">
-            <Info className="w-4 h-4 text-primary" />
-            <CardTitle className="text-sm">Page Summary</CardTitle>
-          </div>
-        </CardHeader>
-        <CardContent className="space-y-3">
-          <div>
-            <h4 className="text-xs font-medium mb-1 text-muted-foreground">Page Analysis</h4>
-            <p className="text-xs">
-              {graph.pageSummary}
-            </p>
-          </div>
-          <Separator />
-          <div>
-            <h4 className="text-xs font-medium mb-1 text-muted-foreground">Technical Overview</h4>
-            <p className="text-xs text-muted-foreground">
-              {graph.description}
-            </p>
-          </div>
-        </CardContent>
-      </Card>
-    </div>
-  );
-}
+        </Panel>
+      </ReactFlow>
+         </div>
+   );
+ }

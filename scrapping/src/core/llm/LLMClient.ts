@@ -9,6 +9,9 @@ import {
   GlobalStore,
   PageStore,
   InteractionGraph,
+  ImageNode,
+  ImageEdge,
+  FlowDefinition,
 } from "../storage/GlobalStore.js";
 import {
   LLMDecisionResponse,
@@ -19,6 +22,101 @@ import {
   PageData,
   ActionHistoryEntry,
 } from "../../types/exploration.js";
+
+// 🔧 ZOD SCHEMAS FOR ROBUST GRAPH GENERATION
+const ImageNodeMetadataSchema = z
+  .object({
+    visibleElements: z
+      .array(z.string())
+      .describe("Description of what's visible on screen"),
+    clickableElements: z
+      .array(z.string())
+      .describe("Description of interactive elements"),
+    flowsConnected: z
+      .array(z.string())
+      .describe("Array of flow IDs this image participates in"),
+    dialogsOpen: z.array(z.string()).describe("Any dialogs/modals open"),
+    timestamp: z.string().describe("When this state was captured"),
+    pageTitle: z.string().optional().describe("Page title if available"),
+    url: z.string().optional().describe("URL of the page if available"),
+  })
+  .describe(
+    "Complete metadata - NEVER omit any fields, use empty arrays if needed"
+  );
+
+const ImageNodeSchema = z.object({
+  id: z
+    .string()
+    .describe("Unique identifier matching imageName (e.g., 'step_5_abc12345')"),
+  imageName: z.string().describe("Same as id for consistency"),
+  imageData: z
+    .string()
+    .describe(
+      "Use 'PLACEHOLDER_WILL_BE_REPLACED' - real data mapped after generation"
+    ),
+  instruction: z.string().describe("The action that led to this state"),
+  stepNumber: z.number().describe("Step number when this state was captured"),
+  metadata: ImageNodeMetadataSchema,
+  position: z
+    .object({
+      x: z.number(),
+      y: z.number(),
+    })
+    .optional()
+    .describe("Optional positioning for frontend layout"),
+});
+
+const ImageEdgeSchema = z.object({
+  from: z.string().describe("Source imageName"),
+  to: z.string().describe("Target imageName"),
+  action: z
+    .string()
+    .describe("Specific action taken (e.g., 'expand_navigation_menu')"),
+  instruction: z
+    .string()
+    .describe("Full instruction that caused the transition"),
+  description: z
+    .string()
+    .describe("Clear description of what this transition accomplishes"),
+  flowId: z.string().optional().describe("Optional flow this edge belongs to"),
+});
+
+const FlowDefinitionSchema = z.object({
+  id: z
+    .string()
+    .describe("Unique flow identifier (snake_case version of name)"),
+  name: z
+    .string()
+    .describe(
+      "Human-readable descriptive name (e.g., 'User Authentication Process')"
+    ),
+  description: z.string().describe("What this flow accomplishes"),
+  startImageName: z.string().describe("Initial state of the flow"),
+  endImageNames: z.array(z.string()).describe("Possible end states"),
+  imageNodes: z.array(z.string()).describe("All image nodes in this flow"),
+  flowType: z
+    .enum(["linear", "branching", "circular"])
+    .describe("Flow pattern type"),
+});
+
+const InteractionGraphSchema = z.object({
+  nodes: z
+    .array(ImageNodeSchema)
+    .describe("All image nodes - MUST preserve existing + add new"),
+  edges: z
+    .array(ImageEdgeSchema)
+    .describe("All edges - MUST preserve existing + add new"),
+  flows: z
+    .array(FlowDefinitionSchema)
+    .describe("All flows - MUST preserve existing + add new"),
+  description: z
+    .string()
+    .describe("Comprehensive visual flow analysis summary"),
+  pageSummary: z
+    .string()
+    .describe("Detailed application summary with all workflows discovered"),
+  lastUpdated: z.string().describe("ISO timestamp of when graph was generated"),
+});
 
 export class LLMClient {
   private model: LanguageModel;
@@ -35,7 +133,7 @@ export class LLMClient {
     // Vertex AI authentication should be set up via Application Default Credentials
 
     // Initialize Vertex AI model (Gemini)
-    this.model = vertex("gemini-2.5-flash");
+    this.model = vertex("gemini-1.5-pro");
 
     // Initialize Claude model for graph generation
     this.claudeModel = anthropic("claude-4-sonnet-20250514");
@@ -336,10 +434,75 @@ ACTIONS REQUIRING CONFIRMATION (NON-EXHAUSTIVE LIST):
 - Clicking to view product details (without adding to cart)
 - Browsing/viewing content only
 
+🚫 CRITICAL: ACTIONS TO ABSOLUTELY AVOID:
+⛔ **NEVER CLICK LOGOUT/SIGN OUT BUTTONS**:
+- "Logout", "Sign Out", "Log Out", "Exit", "Disconnect"
+- User menu items that end sessions
+- Account termination options
+- Session ending controls
+
+⚔️ **SMART CONTENT SELECTION STRATEGY**:
+When you see MULTIPLE SIMILAR ITEMS, only interact with ONE example:
+
+📋 **Project Lists**: Click only one project to explore, not all projects
+🎥 **Video Lists**: Click only one video to test functionality, not every video  
+📝 **Task Lists**: Select only one task to understand the workflow, not all tasks
+📰 **Article Lists**: Click only one article to see the reading experience
+🛍️ **Product Lists**: Explore only one product to understand the interface
+👥 **User Profiles**: Check only one profile to see the profile page structure
+📁 **File Lists**: Open only one file to understand file management
+🏢 **Company Lists**: Select only one company to see company details
+📧 **Message Lists**: Open only one message to see message interface
+🔖 **Category Lists**: Explore only one category to understand navigation
+
+💡 **SELECTION CRITERIA**:
+- Choose the FIRST or most prominent item
+- Pick items that seem most representative  
+- Avoid testing every single similar item
+- Focus on understanding the PATTERN, not exhausting all examples
+
+**Examples**:
+✅ "Click on the first project in the project list to explore project details"
+✅ "Select the top video to understand the video player interface"
+✅ "Open the first task to see task management functionality"
+❌ "Click on all projects to see each one"
+❌ "Test every video in the list"
+❌ "Open all tasks to explore them"
+
 Available tools:
 - page_act: Perform actions on the page (click, type, scroll to a section, scroll to bottom etc.) - provide instruction parameter
-- user_input: Request input from user (for login forms, OTP, email verification links, confirmations, etc.) - supports single or multiple inputs at once (only ask what you need or what is visible on the page)
+- user_input: Request input from user (for login forms, OTP, email verification links, confirmations, etc.) - supports single or multiple inputs at once
 - standby: Wait for loading states or page changes - provide waitTimeSeconds parameter
+
+🔍 SCREENSHOT-BASED INPUT REQUIREMENTS:
+When using user_input tool, you MUST ONLY ask for inputs that are VISIBLE on the screenshot:
+
+✅ CORRECT APPROACH:
+- Look at the screenshot and identify what input fields are actually present
+- Only ask for inputs that correspond to visible form fields
+- If you see only an email field → ask only for email
+- If you see email + password fields → ask for both
+- If you see email + password + OTP fields → ask for all three
+- If you see a verification link field → ask for the link
+
+❌ INCORRECT APPROACH:
+- Asking for password when only email field is visible
+- Asking for OTP when no OTP field is shown
+- Asking for inputs that don't correspond to visible form elements
+- Assuming fields exist without seeing them in the screenshot
+
+📋 INPUT FIELD IDENTIFICATION:
+- **Email field**: Look for "Email", "E-mail", "Username", or email input type
+- **Password field**: Look for "Password", "Pass", or password input type  
+- **OTP field**: Look for "OTP", "Verification Code", "Code", or similar
+- **Phone field**: Look for "Phone", "Mobile", "Number", or tel input type
+- **Verification link**: Look for "Verification Link", "Confirm Link", or URL field
+
+🎯 EXAMPLES:
+✅ Screenshot shows only email field → Ask: "Please provide your email address"
+✅ Screenshot shows email + password → Ask: "Please provide your email and password"
+✅ Screenshot shows email + password + OTP → Ask: "Please provide your email, password, and OTP code"
+❌ Screenshot shows only email field → Don't ask for password or OTP
 
 ⚡ CRITICAL: MULTIPLE INPUTS → SINGLE page_act:
 When you have collected MULTIPLE inputs (like email + password), use a SINGLE page_act to fill all fields:
@@ -370,7 +533,8 @@ ${
 🔒 SENSITIVE FLOW DETECTED (${flowContext.flowType || "unknown"}):
 - URL changes will NOT trigger new page queuing (prevents login flow interruption)
 - Focus on completing the current flow (login, signup, verification, etc.)
-- Use user_input tool when you need additional credentials or verification codes (only ask what you need or what is visible on the page)
+- Use user_input tool when you need additional credentials or verification codes
+- **IMPORTANT**: Only ask for inputs that are VISIBLE on the screenshot (email field → ask email, password field → ask password, etc.)
 - Only after completing the sensitive flow should you return to normal exploration
 `
     : ""
@@ -1387,290 +1551,332 @@ Analyze the screenshot and determine if the graph needs updating.`;
     sourceUrl: string,
     targetUrl: string
   ): Promise<InteractionGraph | null> {
-    try {
-      const systemPrompt = `You are an expert UI/UX analyst updating comprehensive interaction flow graphs for web pages.
-
-🚨 CRITICAL WARNING: This response will COMPLETELY REPLACE the existing graph. You MUST preserve ALL existing nodes, edges, descriptions, and summaries while adding navigation relationships.
-
-NAVIGATION DETAILS:
-- Source Page: ${sourceUrl}
-- Target Page: ${targetUrl}
-- Navigation Action: "${navigationAction}"
-
-ACTION HISTORY ON SOURCE PAGE:
-${sourcePageStore.actionHistory
-  .map(
-    (action, index) => `
-${index + 1}. "${action.instruction}" (Step ${action.stepNumber})
-   Timestamp: ${action.timestamp}
-`
-  )
-  .join("")}
-
-${
-  currentGraph
-    ? `
-🔒 EXISTING GRAPH TO PRESERVE COMPLETELY:
-- Current Nodes: ${currentGraph.nodes.length} (MUST PRESERVE ALL)
-- Current Edges: ${currentGraph.edges.length} (MUST PRESERVE ALL)
-- Description: ${currentGraph.description}
-- Page Summary: ${currentGraph.pageSummary}
-
-EXISTING NODES (PRESERVE EVERY SINGLE ONE):
-${currentGraph.nodes.map((node) => `- ${node.id}: ${node.label} (${node.type}) - ${node.description}`).join("\n")}
-
-EXISTING EDGES (PRESERVE EVERY SINGLE ONE):
-${currentGraph.edges.map((edge) => `- ${edge.from} → ${edge.to}: ${edge.action} - ${edge.description}`).join("\n")}
-
-⚠️ CRITICAL: Your response replaces everything. Include ALL existing nodes and edges above, plus navigation updates.
-`
-    : "No existing graph - create from scratch with navigation relationship."
-}
-
-NODE TYPES AVAILABLE (Use ALL relevant types):
-- **button**: Clickable buttons, submit buttons, action buttons, menu items
-- **link**: Navigation links, anchor tags, clickable text links  
-- **input**: Text fields, search boxes, form inputs, text areas
-- **dropdown**: Select dropdowns, combo boxes, option menus, filter dropdowns
-- **toggle**: Checkboxes, radio buttons, switches, toggle controls
-- **tab**: Tab controls, navigation tabs, tab panels, tab sections
-- **section**: Page sections, containers, content areas, UI regions
-- **dialog**: Modals, popups, overlay dialogs, confirmation boxes
-- **state**: Page states, dynamic content states, view states
-- **navigation_target**: External pages, destination pages from navigation
-
-MANDATORY GROUPING SYSTEM:
-1. **Every node MUST connect to something or belong to a section**
-2. **Create section nodes** for logical UI areas: header, sidebar, main_content, footer, navigation, forms, etc.
-3. **Use "belongs_to" edges** to connect elements to their parent sections
-4. **No orphaned nodes**: If a node has no direct interactions, it MUST have a "belongs_to" edge to a section
-
-EDGE TYPES AVAILABLE:
-- **click**: Button clicks, link clicks, menu selections
-- **hover**: Hover interactions, tooltip triggers
-- **type**: Text input, form filling
-- **select**: Dropdown selections, option choosing
-- **toggle**: Checkbox/radio button changes
-- **navigate**: Page navigation, URL changes
-- **reveals**: Shows/reveals content, opens dialogs
-- **triggers**: Triggers actions, starts processes
-- **changes_to**: State changes, content updates
-- **belongs_to**: Element belongs to/is contained within a section
-
-NAVIGATION UPDATE REQUIREMENTS:
-1. Add a "navigation_target" node for: ${targetUrl}
-2. Connect the navigation trigger element to the target page with "navigate" edge
-3. Preserve ALL existing nodes and edges
-4. Add meaningful descriptions for the navigation relationship
-
-RESPONSE FORMAT:
-Respond with ONLY valid JSON:
-{
-  "nodes": [
-    {
-      "id": "unique_node_id",
-      "label": "Human readable label",
-      "description": "Detailed description of what this element does/represents", 
-      "type": "button|link|input|dropdown|toggle|tab|section|dialog|state|navigation_target",
-      "position": {"x": 100, "y": 200}
-    }
-  ],
-  "edges": [
-    {
-      "from": "source_node_id",
-      "to": "target_node_id", 
-      "action": "click|hover|type|select|toggle|navigate|reveals|triggers|changes_to|belongs_to",
-      "description": "Detailed description of what this interaction does or relationship"
-    }
-  ],
-  "description": "COMPREHENSIVE interaction flow description including navigation relationships",
-  "pageSummary": "DETAILED PAGE SUMMARY: Complete description including navigation capability to ${targetUrl} and all other page functionality",
-  "lastUpdated": "${new Date().toISOString()}"
-}
-
-🔥 CRITICAL REQUIREMENTS:
-1. **PRESERVE EVERYTHING**: Include ALL existing nodes, edges, description, and pageSummary from above
-2. **USE ALL NODE TYPES**: Generate button, link, input, dropdown, toggle, tab, section, dialog, state, navigation_target nodes as appropriate
-3. **MANDATORY BELONGS_TO**: Every node must connect to something or belong to a section via "belongs_to" edge  
-4. **SECTION HIERARCHY**: Create section nodes and connect child elements appropriately
-5. **NO DATA LOSS**: Your response completely replaces the existing graph - don't lose any information
-6. **ADD NAVIGATION**: Include new navigation_target node and navigate edge for ${targetUrl}`;
-
-      // Build interleaved conversation history for navigation graph generation
-      const interleavedMessages = this.buildInterleavedConversationHistory(
-        sourcePageStore,
-        sourcePageStore.actionHistory.length > 0
-          ? sourcePageStore.actionHistory[
-              sourcePageStore.actionHistory.length - 1
-            ].after_act
-          : sourcePageStore.initialScreenshot
-      );
-
-      // Add navigation instruction message
-      interleavedMessages.push({
-        role: "user",
-        content: [
-          {
-            type: "text",
-            text: `Update the graph to include navigation to: ${targetUrl} via action: "${navigationAction}"`,
-          },
-        ],
-      });
-
-      logger.info(`📸 Claude navigation graph using interleaved history`, {
-        totalActions: sourcePageStore.actionHistory.length,
-        totalMessages: interleavedMessages.length,
-        navigationAction,
-      });
-
-      const response = await generateText({
-        model: this.claudeModel,
-        system: systemPrompt,
-        maxTokens: 4000,
-        messages: interleavedMessages,
-      });
-
-      let cleanedContent = response.text.trim();
-
-      // Remove markdown formatting if present
-      const jsonMatch = cleanedContent.match(
-        /```(?:json)?\s*(\{[\s\S]*\})\s*```/
-      );
-      if (jsonMatch) {
-        cleanedContent = jsonMatch[1];
-      }
-
-      const graph = JSON.parse(cleanedContent) as InteractionGraph;
-
-      logger.info(`🔗 Claude generated page navigation graph`, {
-        sourceUrl,
-        targetUrl,
-        nodes: graph.nodes.length,
-        edges: graph.edges.length,
-        navigationAction,
-      });
-
-      return graph;
-    } catch (error) {
-      logger.error("❌ Failed to generate page navigation graph with Claude", {
-        error: error instanceof Error ? error.message : String(error),
-        sourceUrl,
-        targetUrl,
-      });
-      return null;
-    }
+    // Use the new comprehensive page change navigation method
+    return this.generatePageChangeNavigationGraph(
+      sourcePageStore,
+      currentGraph,
+      navigationAction,
+      sourceUrl,
+      targetUrl
+    );
   }
 
   /**
-   * Generate interaction graph using Claude
+   * Generate image-based flow interaction graph using Claude
    */
   async generateInteractionGraph(
     globalStore: PageStore,
     currentGraph: InteractionGraph | undefined
   ): Promise<InteractionGraph | null> {
     try {
-      const systemPrompt = `You are an expert UI/UX analyst creating comprehensive interaction flow graphs for web pages.
+      const systemPrompt = `You are an expert UI/UX analyst creating comprehensive image-based flow diagrams for web applications.
 
-🚨 CRITICAL WARNING: This response will COMPLETELY REPLACE the existing graph. You MUST preserve ALL existing nodes, edges, descriptions, and summaries while adding new discoveries.
+${this.flowNamingGuidelines}
+${this.edgeNamingGuidelines}
 
-PAGE DATA:
+🚨 CRITICAL DATA PRESERVATION WARNING:
+Your response will COMPLETELY REPLACE the existing graph. You are STRICTLY FORBIDDEN from losing ANY existing data.
+You MUST include EVERY SINGLE existing node, edge, and flow EXACTLY as they are, plus any new discoveries.
+
+⚠️ ABSOLUTE PRESERVATION REQUIREMENTS:
+- **NEVER MODIFY** existing flows - keep them exactly as they are
+- **NEVER REMOVE** existing nodes or edges - preserve all previous states
+- **NEVER CHANGE** existing flow names, descriptions, or structures
+- **ONLY ADD** new discoveries to existing flows or create new flows
+- **MAINTAIN COMPLETE HISTORY** from the very first step to the current state
+- **PRESERVE ALL TIMESTAMPS** and metadata exactly as they were
+- **KEEP ALL VISUAL STATES** in chronological order without gaps
+
+🔍 COMPLETE ANALYSIS REQUIREMENT:
+You MUST analyze the ENTIRE chat history, ALL screenshots, and EVERY action to create a COMPLETE graph:
+- **EVERY IMAGE MUST BE INCLUDED** in at least one flow - this is COMPULSORY
+- **NO IMAGE CAN BE LEFT OUT** - if an image exists, it must be part of a flow
+- **ANALYZE ALL SCREENSHOTS** from the conversation history
+- **CHECK ALL ACTIONS** performed during exploration
+- **IDENTIFY MISSING IMAGES** that aren't in existing flows
+- **ADD MISSING IMAGES** to appropriate flows or create new flows
+- **COMPLETE EDGE LABELS** for all transitions between images
+- **FULL FLOW COVERAGE** from the very beginning to the very end
+
+🔥 WHAT ARE FLOWS? WHY ARE WE CREATING THEM?
+FLOWS represent complete user journeys through the application:
+- **PURPOSE**: Track how users navigate through different states to accomplish goals
+- **VALUE**: Essential for UX analysis, testing, and understanding user experience
+- **COMPOSITION**: Each flow is a sequence of connected image states showing a complete journey
+
+FLOW EXAMPLES:
+- "User Authentication Process": login_page → enter_credentials → validate → dashboard
+- "File Upload Workflow": main_page → click_upload → file_dialog → select_file → preview → upload_complete
+- "E-commerce Checkout Process": product_page → add_to_cart → cart_view → checkout_form → payment → confirmation
+- "Navigation Discovery Journey": home_page → menu_expand → section_select → content_view
+- "Settings Configuration Flow": dashboard → settings_menu → configuration_panel → save_changes
+
+🚨 CRITICAL FLOW STEP INCLUSION REQUIREMENT:
+⚠️ **NEVER SKIP STEPS IN A FLOW - INCLUDE ALL AVAILABLE IMAGES**:
+- If a flow has multiple step images available, you MUST include EVERY SINGLE ONE
+- Do NOT skip intermediate steps or combine multiple steps into one
+- Each step image represents a distinct state that must be preserved
+- Missing steps break the flow continuity and lose valuable UX data
+
+**Example - File Upload Flow**:
+❌ WRONG: step_0_initial → step_5_upload_complete (missing steps 1,2,3,4)
+✅ CORRECT: step_0_initial → step_1_click_upload → step_2_file_dialog → step_3_file_selected → step_4_preview → step_5_upload_complete
+
+**Flow Completeness Rules**:
+1. Include EVERY image that belongs to the flow sequence
+2. Maintain chronological order of step numbers
+3. Connect ALL intermediate steps with appropriate edges
+4. Each step must show progression toward the flow goal
+5. No gaps allowed in step sequences
+
+🎯 IMAGE STATE ANALYSIS OVERVIEW:
+You are analyzing screenshots captured during web exploration. Each image represents a different APPLICATION STATE after specific user actions.
+
+🔧 YOUR CORE RESPONSIBILITIES:
+1. **VISUAL DEDUPLICATION**: Identify visually identical states and merge into single nodes
+2. **FLOW MAPPING**: Group related image sequences into logical user journeys  
+3. **PATTERN DETECTION**: Identify linear, branching, and circular flow patterns
+4. **TRANSITION ANALYSIS**: Create edges ONLY when visual changes actually occur
+
+⚠️ CRITICAL EDGE CREATION RULES - VISUAL CHANGE DETECTION:
+🔍 ONLY CREATE EDGES WHEN THERE ARE ACTUAL VISUAL CHANGES:
+- Compare the "before" image state with the "after action" image state
+- IF the images are visually identical → DO NOT create an edge
+- IF the images show different content/UI → CREATE an edge
+
+❌ DO NOT CREATE EDGES FOR:
+- Button clicks that don't change the page visually (no response)
+- Hover actions that don't trigger visual changes
+- Clicks on inactive/disabled elements
+- Actions that fail silently without UI feedback
+- Form submissions that don't show success/error states
+- Loading states that look identical to the previous state
+
+✅ CREATE EDGES ONLY FOR:
+- Page navigation (different page content)
+- Modal/dialog opening or closing
+- Form field changes (text appears in inputs)
+- Content updates (new text/images appear)
+- UI state changes (menus expand, tabs switch)
+- Error messages appearing
+- Success notifications showing
+- Loading → content loaded transitions
+
+🔍 VISUAL COMPARISON EXAMPLES:
+Example 1: Click "Upload" button
+- Before: Page with upload button
+- After: SAME page with upload button (no change)
+- → NO EDGE (action had no visual effect)
+
+Example 2: Click "Upload" button
+- Before: Page with upload button  
+- After: File selection dialog opened
+- → CREATE EDGE (visual change occurred)
+
+Example 3: Type in input field
+- Before: Empty input field
+- After: Input field with text visible
+- → CREATE EDGE (visual change occurred)
+
+PAGE DATA ANALYSIS:
 - URL: ${globalStore.url}  
 - Total Actions Performed: ${globalStore.actionHistory.length}
+- Initial Screenshot: Available as baseline state
 
-ACTION HISTORY:
+📝 ACTION SEQUENCE TO ANALYZE:
 ${globalStore.actionHistory
   .map(
     (action, index) => `
-${index + 1}. "${action.instruction}" (Step ${action.stepNumber})
-   Timestamp: ${action.timestamp}
+${index + 1}. Action: "${action.instruction}" 
+   → Results in State: ${action.imageName}
+   Step: ${action.stepNumber} | Time: ${action.timestamp}
 `
   )
   .join("")}
 
+🔍 COMPLETE IMAGE INVENTORY CHECK:
+You MUST ensure EVERY image is included in a flow:
+
+AVAILABLE IMAGES:
+1. **Initial State**: step_0_initial (${globalStore.initialScreenshot ? "Available" : "Missing"})
+${globalStore.actionHistory
+  .map(
+    (action, index) =>
+      `${index + 2}. **After Action ${action.stepNumber}**: ${action.imageName} (${action.after_act ? "Available" : "Missing"})`
+  )
+  .join("\n")}
+
+🚨 MANDATORY FLOW INCLUSION RULES:
+- **EVERY SINGLE IMAGE ABOVE MUST BE INCLUDED** in at least one flow
+- **NO IMAGE CAN BE EXCLUDED** - if it exists in the data, it must be in a flow
+- **CHECK EACH IMAGE** against existing flows to ensure coverage
+- **ADD MISSING IMAGES** to appropriate flows or create new flows
+- **COMPLETE THE JOURNEY** from first image to last image
+
 ${
   currentGraph
     ? `
-🔒 EXISTING GRAPH TO PRESERVE COMPLETELY:
-- Current Nodes: ${currentGraph.nodes.length} (MUST PRESERVE ALL)
-- Current Edges: ${currentGraph.edges.length} (MUST PRESERVE ALL)
+🔒 EXISTING GRAPH DATA TO PRESERVE COMPLETELY:
+YOU ARE ABSOLUTELY FORBIDDEN FROM LOSING ANY OF THIS DATA.
+EVERY SINGLE ITEM BELOW MUST BE INCLUDED IN YOUR RESPONSE.
+
+🚨 STRICT PRESERVATION RULES:
+- **COPY EVERYTHING EXACTLY** - do not modify, remove, or change anything
+- **MAINTAIN COMPLETE TIMELINE** from step 0 to current step
+- **PRESERVE ALL FLOW STRUCTURES** exactly as they are
+- **KEEP ALL NODE CONNECTIONS** and relationships intact
+- **NEVER REORGANIZE** existing flows or change their names
+- **ONLY ADD NEW CONTENT** to existing flows or create new flows
+
+CURRENT STATISTICS:
+- Image Nodes: ${currentGraph.nodes.length} (PRESERVE ALL)
+- Edges: ${currentGraph.edges.length} (PRESERVE ALL)  
+- Flows: ${currentGraph.flows?.length || 0} (PRESERVE ALL)
 - Description: ${currentGraph.description}
 - Page Summary: ${currentGraph.pageSummary}
 
-EXISTING NODES (PRESERVE EVERY SINGLE ONE):
-${currentGraph.nodes.map((node) => `- ${node.id}: ${node.label} (${node.type}) - ${node.description}`).join("\n")}
+EXISTING IMAGE NODES (PRESERVE EVERY SINGLE ONE):
+${currentGraph.nodes.map((node) => `- ${node.id}: Step ${node.stepNumber} | Action: "${node.instruction}" | Flows: [${node.metadata.flowsConnected.join(", ")}]`).join("\n")}
 
 EXISTING EDGES (PRESERVE EVERY SINGLE ONE):
-${currentGraph.edges.map((edge) => `- ${edge.from} → ${edge.to}: ${edge.action} - ${edge.description}`).join("\n")}
+${currentGraph.edges.map((edge) => `- ${edge.from} → ${edge.to}: ${edge.action} | ${edge.description}`).join("\n")}
 
-⚠️ CRITICAL: Your response replaces everything. Include ALL existing nodes and edges above, plus any new discoveries.
+EXISTING FLOWS (PRESERVE EVERY SINGLE ONE):
+${currentGraph.flows?.map((flow) => `- ${flow.id}: ${flow.name} (${flow.flowType}) | Images: [${flow.imageNodes.join(", ")}]`).join("\n") || "No existing flows"}
+
+🚨 CRITICAL: Your response replaces everything. Include ALL existing items above PLUS any new discoveries.
+**NEVER REMOVE OR MODIFY** any of the above data - only add new content.
+
+🔍 COMPLETE GRAPH VERIFICATION:
+Before finalizing your response, verify that:
+1. **EVERY IMAGE** from the inventory is included in at least one flow
+2. **ALL EDGES** have complete labels describing the transitions
+3. **ALL FLOWS** cover the complete journey from start to end
+4. **NO IMAGES** are left out or missing from flows
+5. **COMPLETE TIMELINE** is maintained from step 0 to final step
+
+🎯 YOUR GOAL: Create a COMPLETE graph that shows the ENTIRE user journey with EVERY image included in appropriate flows.
 `
-    : "No existing graph - create from scratch."
+    : "No existing graph - create from scratch by analyzing the image sequence."
 }
 
-NODE TYPES AVAILABLE (Use ALL relevant types based on UI elements):
-- **button**: Clickable buttons, submit buttons, action buttons, menu items
-- **link**: Navigation links, anchor tags, clickable text links  
-- **input**: Text fields, search boxes, form inputs, text areas
-- **dropdown**: Select dropdowns, combo boxes, option menus, filter dropdowns
-- **toggle**: Checkboxes, radio buttons, switches, toggle controls
-- **tab**: Tab controls, navigation tabs, tab panels, tab sections
-- **section**: Page sections, containers, content areas, UI regions
-- **dialog**: Modals, popups, overlay dialogs, confirmation boxes
-- **state**: Page states, dynamic content states, view states
-- **navigation_target**: External pages, destination pages from navigation
+🏗️ STANDARDIZED NAMING REQUIREMENTS:
 
-MANDATORY GROUPING SYSTEM:
-1. **Every node MUST connect to something or belong to a section**
-2. **Create section nodes** for logical UI areas: header, sidebar, main_content, footer, navigation, forms, etc.
-3. **Use "belongs_to" edges** to connect elements to their parent sections
-4. **No orphaned nodes**: If a node has no direct interactions, it MUST have a "belongs_to" edge to a section
+INITIAL IMAGE NAMING:
+- The very first image (page load) MUST ALWAYS be named: "step_0_initial"
+- This provides consistent identification across all graphs
 
-EDGE TYPES AVAILABLE:
-- **click**: Button clicks, link clicks, menu selections
-- **hover**: Hover interactions, tooltip triggers
-- **type**: Text input, form filling
-- **select**: Dropdown selections, option choosing
-- **toggle**: Checkbox/radio button changes
-- **navigate**: Page navigation, URL changes
-- **reveals**: Shows/reveals content, opens dialogs
-- **triggers**: Triggers actions, starts processes
-- **changes_to**: State changes, content updates
-- **belongs_to**: Element belongs to/is contained within a section
+FLOW NAMING RULES:
+✅ GOOD FLOW NAMES (use these patterns):
+- "User Authentication Process" (not "login_flow")
+- "File Upload Workflow" (not "upload_flow")  
+- "Product Search Journey" (not "search_flow")
+- "Account Registration Process" (not "signup_flow")
+- "Settings Configuration Flow" (not "settings_flow")
+- "Payment Checkout Process" (not "payment_flow")
+- "Content Creation Workflow" (not "content_flow")
+- "Navigation Discovery Journey" (not "navigation_flow")
+- "Form Validation Process" (not "form_flow")
+- "Modal Interaction Sequence" (not "dialog_flow")
 
-RESPONSE FORMAT:
-Respond with ONLY valid JSON:
+🎯 **FUTURE-FOCUSED FLOW NAMING STRATEGY**:
+Create flow names that answer: "If someone wanted to accomplish this task in the future, what would they search for?"
+
+**Naming Framework**: [Action/Goal] + [Process Type] + [Context]
+
+**Examples of Excellent Flow Names**:
+✅ "Complete User Onboarding Experience" - Shows the entire new user journey
+✅ "Project Creation and Setup Workflow" - Clear about creating and configuring projects  
+✅ "Document Upload and Processing Pipeline" - File handling from start to finish
+✅ "User Profile Management and Customization" - Profile editing capabilities
+✅ "E-commerce Product Discovery and Purchase Journey" - Shopping experience
+✅ "Customer Support Ticket Submission and Tracking" - Help desk workflow
+✅ "Content Publishing and Review Process" - Publishing workflow
+✅ "Team Collaboration and Communication Flow" - Team interaction patterns
+✅ "Financial Transaction and Payment Processing" - Money handling workflows
+✅ "Data Import, Validation, and Integration Process" - Data handling pipeline
+
+**What Makes a Great Flow Name**:
+1. **Action-Oriented**: Starts with what the user wants to accomplish
+2. **Complete Scope**: Indicates the full journey from start to finish  
+3. **Searchable**: Uses terms someone would search for
+4. **Professional**: Sounds like documentation someone would reference
+5. **Specific**: Clearly distinguishes from other workflows
+6. **Future-Proof**: Remains relevant as the application evolves
+
+**Bad Flow Names to Avoid**:
+❌ "dialog_flow" → ✅ "Modal Dialog Interaction and Form Submission Process"
+❌ "navigation_flow" → ✅ "Site Navigation and Content Discovery Journey"  
+❌ "form_flow" → ✅ "Data Entry, Validation, and Submission Workflow"
+❌ "menu_flow" → ✅ "Navigation Menu Exploration and Section Access"
+❌ "button_flow" → ✅ "Action Button Interaction and Response Handling"
+
+EDGE NAMING RULES:
+✅ GOOD EDGE DESCRIPTIONS (specific and clear):
+- "User clicks Upload button to open file selection dialog"
+- "System displays validation error after form submission"
+- "Navigation menu expands revealing section options"
+- "Login form validates credentials and redirects to dashboard"
+- "File preview appears after successful file selection"
+
+EDGE ACTION NAMING RULES:
+✅ GOOD ACTION NAMES (specific verbs):
+- "expand_navigation_menu" (not "click_menu")
+- "open_file_dialog" (not "click_upload")
+- "validate_login_form" (not "submit_form")
+- "display_error_message" (not "show_error")
+- "redirect_to_dashboard" (not "navigate")
+
+🔍 CONTEXT-BASED NAMING:
+Base your flow names on what you actually see in the screenshots:
+- If you see login forms → "User Authentication Process"
+- If you see file upload dialogs → "Document Upload Workflow" 
+- If you see shopping cart → "E-commerce Checkout Process"
+- If you see settings panels → "System Configuration Flow"
+- If you see search results → "Content Discovery Journey"
+- If you see dashboard elements → "User Portal Navigation"
+- If you see forms with validation → "Data Entry Validation Process"
+
+💡 FLOW ID GENERATION:
+Convert descriptive names to IDs by:
+- "User Authentication Process" → id: "user_authentication_process"
+- "File Upload Workflow" → id: "file_upload_workflow"  
+- "Modal Interaction Sequence" → id: "modal_interaction_sequence"
+
+📋 REQUIRED METADATA STRUCTURE:
+Every node MUST have complete metadata structure with ALL fields:
 {
-  "nodes": [
-    {
-      "id": "unique_node_id",
-      "label": "Human readable label",
-      "description": "Detailed description of what this element does/represents", 
-      "type": "button|link|input|dropdown|toggle|tab|section|dialog|state|navigation_target",
-      "position": {"x": 100, "y": 200}
-    }
-  ],
-  "edges": [
-    {
-      "from": "source_node_id",
-      "to": "target_node_id", 
-      "action": "click|hover|type|select|toggle|navigate|reveals|triggers|changes_to|belongs_to",
-      "description": "Detailed description of what this interaction does or relationship"
-    }
-  ],
-  "description": "COMPREHENSIVE interaction flow description covering all page capabilities and relationships",
-  "pageSummary": "DETAILED PAGE SUMMARY: Complete description of what the user can accomplish on this page. Include all available actions, features, forms, navigation options, interactive elements, and capabilities. Be specific about what tasks can be performed, what information can be accessed, and what workflows are possible. This should serve as a complete guide for understanding the page's functionality.",
-  "lastUpdated": "${new Date().toISOString()}"
+  "metadata": {
+    "visibleElements": ["Login form", "Email input", "Password field"],
+    "clickableElements": ["Submit button", "Forgot password link"],
+    "flowsConnected": ["user_authentication_process"], 
+    "dialogsOpen": [],
+    "timestamp": "2024-01-01T12:00:00Z",
+    "pageTitle": "Login Page"
+  }
 }
+
+⚠️ NEVER omit any metadata fields - use empty arrays [] if no elements exist
 
 🔥 CRITICAL REQUIREMENTS:
-1. **PRESERVE EVERYTHING**: Include ALL existing nodes, edges, description, and pageSummary from above
-2. **USE ALL NODE TYPES**: Generate button, link, input, dropdown, toggle, tab, section, dialog, state, navigation_target nodes as appropriate
-3. **MANDATORY BELONGS_TO**: Every node must connect to something or belong to a section via "belongs_to" edge
-4. **SECTION HIERARCHY**: Create section nodes (header, main_content, sidebar, footer, etc.) and connect child elements
-5. **NO DATA LOSS**: Your response completely replaces the existing graph - don't lose any information
-6. **COMPREHENSIVE COVERAGE**: Include every interactive element discovered in the action history screenshots`;
+1. **PRESERVE EVERYTHING**: Include ALL existing nodes, edges, flows, descriptions
+2. **VISUAL DEDUPLICATION**: Merge visually identical screenshots into single nodes
+3. **FLOW GROUPING**: Create logical workflow groupings with clear start/end states
+4. **ACTION PRECISION**: Use specific action names like "expand_navigation_menu"
+5. **NO DATA LOSS**: Your response completely replaces existing graph - don't lose anything
+6. **COMPREHENSIVE ANALYSIS**: Analyze every screenshot for visual elements and interactions
+7. **VISUAL CHANGE VALIDATION**: Only create edges when you can confirm visual differences
+8. **COMPLETE METADATA**: Every node MUST have complete metadata structure
+9. **STANDARD NAMING**: Initial image MUST be "step_0_initial"
+10. **FLOW EXPLANATIONS**: Use descriptive, human-readable flow names that explain the journey
 
-      // Build interleaved conversation history for graph generation
+🚨 FINAL PRESERVATION WARNING:
+**YOUR RESPONSE MUST CONTAIN EVERY SINGLE EXISTING ITEM PLUS NEW CONTENT.**
+**NEVER DELETE, MODIFY, OR REORGANIZE EXISTING DATA.**
+**ONLY ADD NEW DISCOVERIES TO THE COMPLETE EXISTING STRUCTURE.**
+**MAINTAIN COMPLETE TIMELINE FROM STEP 0 TO CURRENT STEP.**`;
+
+      // Build interleaved conversation history for image analysis
       const interleavedMessages = this.buildInterleavedConversationHistory(
         globalStore,
         globalStore.actionHistory.length > 0
@@ -1685,48 +1891,125 @@ Respond with ONLY valid JSON:
         content: [
           {
             type: "text",
-            text: `Generate a comprehensive interaction graph based on all the action history and screenshots. ${currentGraph ? "Update the existing graph with new findings." : "Create a complete new graph."}`,
+            text: `Analyze all the screenshots and create a comprehensive image-based flow diagram. Focus on:
+
+1. **Visual deduplication** of identical states
+2. **Flow pattern detection** (linear, branching, circular) 
+3. **Action transition mapping** between image states (ONLY when visual changes occur)
+4. **Comprehensive metadata** for each visual state
+5. **Complete preservation** of all existing graph data
+
+🚨 CRITICAL PRESERVATION REMINDER:
+- Include EVERY existing node, edge, and flow EXACTLY as they are
+- Add new discoveries while preserving all existing data
+- Initial image MUST be named "step_0_initial"
+- Only create edges when screenshots show actual visual changes
+
+🔍 COMPLETE ANALYSIS INSTRUCTIONS:
+1. **ANALYZE EVERY SCREENSHOT** in the conversation history
+2. **CHECK ALL ACTIONS** performed during exploration
+3. **IDENTIFY ALL IMAGES** that should be included in flows
+4. **ENSURE EVERY IMAGE** is part of at least one flow
+5. **ADD MISSING IMAGES** to appropriate flows or create new flows
+6. **COMPLETE ALL EDGE LABELS** with detailed transition descriptions
+7. **VERIFY COMPLETE COVERAGE** from start to end
+
+${currentGraph ? "UPDATE the existing graph preserving ALL current data and adding any missing images/flows." : "CREATE a complete new visual flow diagram with ALL images included."}
+
+🎯 FINAL GOAL: Create a COMPLETE graph showing the ENTIRE user journey with EVERY image included in appropriate flows.
+
+Remember: Compare each before/after image pair carefully. If the UI looks identical, don't create an edge for that action.`,
           },
         ],
       });
 
-      logger.info(`📸 Claude graph generation using interleaved history`, {
+      logger.info(`📸 Claude image flow analysis using structured generation`, {
         totalActions: globalStore.actionHistory.length,
         totalMessages: interleavedMessages.length,
+        url: globalStore.url,
+        existingNodes: currentGraph?.nodes.length || 0,
+        existingEdges: currentGraph?.edges.length || 0,
+        existingFlows: currentGraph?.flows?.length || 0,
       });
 
-      const response = await generateText({
-        model: this.claudeModel,
+      // 🆕 USE GENERATEOBJECT FOR ROBUST JSON PARSING
+      const response = await generateObject({
+        model: vertex("gemini-2.5-flash"),
         system: systemPrompt,
-        maxTokens: 4000,
+        maxTokens: 8000, // Increased for comprehensive analysis
         messages: interleavedMessages,
+        schema: InteractionGraphSchema,
       });
 
-      let cleanedContent = response.text.trim();
+      const graph = response.object as InteractionGraph;
 
-      // Remove markdown formatting if present
-      const jsonMatch = cleanedContent.match(
-        /```(?:json)?\s*(\{[\s\S]*\})\s*```/
-      );
-      if (jsonMatch) {
-        cleanedContent = jsonMatch[1];
+      // Validate that we have the expected structure
+      if (!graph.nodes || !graph.edges || !graph.flows) {
+        throw new Error("Invalid graph structure - missing required fields");
       }
 
-      const graph = JSON.parse(cleanedContent) as InteractionGraph;
+      // 🔧 MAP REAL IMAGE DATA TO NODES
+      const imageDataMap = new Map<string, string>();
 
-      logger.info(`📊 Claude generated interaction graph`, {
+      // Add initial screenshot with standardized naming
+      imageDataMap.set("step_0_initial", globalStore.initialScreenshot);
+
+      // Also add with hash for compatibility
+      const initialHash = this.generateImageHashFromData(
+        globalStore.initialScreenshot
+      );
+      imageDataMap.set(`step_0_${initialHash}`, globalStore.initialScreenshot);
+
+      // Add action screenshots
+      globalStore.actionHistory.forEach((action) => {
+        imageDataMap.set(action.imageName, action.after_act);
+      });
+
+      // Update nodes with real image data
+      graph.nodes.forEach((node) => {
+        const realImageData =
+          imageDataMap.get(node.imageName) || imageDataMap.get(node.id);
+        if (realImageData) {
+          node.imageData = realImageData;
+        } else {
+          logger.warn(`⚠️ No image data found for node: ${node.imageName}`, {
+            availableImageNames: Array.from(imageDataMap.keys()),
+            nodeImageName: node.imageName,
+            nodeId: node.id,
+          });
+          // Use default 1x1 transparent pixel
+          node.imageData =
+            "https://cdn.dribbble.com/userupload/37152919/file/original-2223c68ac929d569c5204e50ab0d302c.png?resize=1504x1128&vertical=center";
+        }
+      });
+
+      logger.info(`📊 Claude generated structured image-based flow diagram`, {
         url: globalStore.url,
-        nodes: graph.nodes.length,
+        imageNodes: graph.nodes.length,
         edges: graph.edges.length,
+        flows: graph.flows.length,
         description: graph.description.substring(0, 100),
+        realImagesAssigned: graph.nodes.filter(
+          (n) => n.imageData !== "PLACEHOLDER_WILL_BE_REPLACED"
+        ).length,
+        preservedFromExisting: currentGraph
+          ? {
+              nodes: currentGraph.nodes.length,
+              edges: currentGraph.edges.length,
+              flows: currentGraph.flows?.length || 0,
+            }
+          : "new_graph",
       });
 
       return graph;
     } catch (error) {
-      logger.error("❌ Failed to generate interaction graph with Claude", {
-        error: error instanceof Error ? error.message : String(error),
-        url: globalStore.url,
-      });
+      logger.error(
+        "❌ Failed to generate structured image-based flow diagram",
+        {
+          error: error instanceof Error ? error.message : String(error),
+          url: globalStore.url,
+        }
+      );
       return null;
     }
   }
@@ -1837,4 +2120,478 @@ Respond with ONLY valid JSON:
       .png()
       .toBuffer();
   }
+
+  /**
+   * Generate a short hash from image data for unique naming
+   * Same logic as in GlobalStore
+   */
+  private generateImageHashFromData(imageData: string): string {
+    // Simple hash generation from image data
+    let hash = 0;
+    const str = imageData.substring(0, 1000); // Use first 1000 chars for hash
+    for (let i = 0; i < str.length; i++) {
+      const char = str.charCodeAt(i);
+      hash = (hash << 5) - hash + char;
+      hash = hash & hash; // Convert to 32-bit integer
+    }
+    return Math.abs(hash).toString(16).substring(0, 8); // 8 character hex hash
+  }
+
+  /**
+   * Generate navigation graph when page changes occur
+   * Creates a special node with placeholder image for page transitions
+   */
+  async generatePageChangeNavigationGraph(
+    sourcePageStore: PageStore,
+    currentGraph: InteractionGraph | undefined,
+    navigationAction: string,
+    sourceUrl: string,
+    targetUrl: string
+  ): Promise<InteractionGraph | null> {
+    try {
+      logger.info(`🔗 Generating page change navigation graph`, {
+        sourceUrl,
+        targetUrl,
+        action: navigationAction,
+      });
+
+      // Create page transition placeholder image URL
+      const pageTransitionImageUrl =
+        "https://cdn.dribbble.com/userupload/37152919/file/original-2223c68ac929d569c5204e50ab0d302c.png?resize=1504x1128&vertical=center";
+
+      const systemPrompt = `You are an expert UI/UX analyst creating navigation graphs for page-to-page transitions.
+
+${this.flowNamingGuidelines}
+${this.edgeNamingGuidelines}
+
+🚨 CRITICAL DATA PRESERVATION WARNING:
+Your response will COMPLETELY REPLACE the existing graph. You are STRICTLY FORBIDDEN from losing ANY existing data.
+You MUST include EVERY SINGLE existing node, edge, and flow EXACTLY as they are, plus the new page navigation.
+
+⚠️ ABSOLUTE PRESERVATION REQUIREMENTS:
+- **NEVER MODIFY** existing flows - keep them exactly as they are
+- **NEVER REMOVE** existing nodes or edges - preserve all previous states
+- **NEVER CHANGE** existing flow names, descriptions, or structures
+- **ONLY ADD** new page navigation to existing flows or create new flows
+- **MAINTAIN COMPLETE HISTORY** from the very first step to the current state
+- **PRESERVE ALL TIMESTAMPS** and metadata exactly as they were
+- **KEEP ALL VISUAL STATES** in chronological order without gaps
+
+🔍 COMPLETE ANALYSIS REQUIREMENT:
+You MUST analyze the ENTIRE navigation history and ALL page states to create a COMPLETE graph:
+- **EVERY PAGE STATE MUST BE INCLUDED** in at least one flow - this is COMPULSORY
+- **NO PAGE TRANSITION CAN BE LEFT OUT** - if a page exists, it must be part of a flow
+- **ANALYZE ALL PAGE SCREENSHOTS** from the navigation history
+- **CHECK ALL NAVIGATION ACTIONS** performed during exploration
+- **IDENTIFY MISSING PAGE STATES** that aren't in existing flows
+- **ADD MISSING PAGE STATES** to appropriate flows or create new flows
+- **COMPLETE EDGE LABELS** for all page-to-page transitions
+- **FULL NAVIGATION COVERAGE** from the very beginning to the very end
+
+🌐 PAGE CHANGE NAVIGATION OVERVIEW:
+You are creating a navigation relationship between two different pages:
+- **SOURCE PAGE**: ${sourceUrl}
+- **TARGET PAGE**: ${targetUrl}  
+- **NAVIGATION ACTION**: ${navigationAction}
+
+🎯 YOUR RESPONSIBILITIES:
+1. **PRESERVE ALL EXISTING DATA**: Include every existing node, edge, and flow
+2. **ADD PAGE TRANSITION**: Create a new node representing the target page
+3. **CREATE NAVIGATION EDGE**: Connect source page to target page via the action
+4. **MAINTAIN FLOW CONTINUITY**: Ensure navigation fits into existing flows
+
+📝 SOURCE PAGE DATA:
+- URL: ${sourcePageStore.url}
+- Total Actions on Source: ${sourcePageStore.actionHistory.length}
+- Available Image States: ${sourcePageStore.actionHistory.length + 1} (including initial)
+
+${
+  currentGraph
+    ? `
+🔒 EXISTING GRAPH DATA TO PRESERVE COMPLETELY:
+YOU ARE ABSOLUTELY FORBIDDEN FROM LOSING ANY OF THIS DATA.
+
+🚨 STRICT PRESERVATION RULES:
+- **COPY EVERYTHING EXACTLY** - do not modify, remove, or change anything
+- **MAINTAIN COMPLETE TIMELINE** from step 0 to current step
+- **PRESERVE ALL FLOW STRUCTURES** exactly as they are
+- **KEEP ALL NODE CONNECTIONS** and relationships intact
+- **NEVER REORGANIZE** existing flows or change their names
+- **ONLY ADD NEW CONTENT** to existing flows or create new flows
+
+CURRENT STATISTICS:
+- Image Nodes: ${currentGraph.nodes.length} (PRESERVE ALL)
+- Edges: ${currentGraph.edges.length} (PRESERVE ALL)  
+- Flows: ${currentGraph.flows?.length || 0} (PRESERVE ALL)
+
+EXISTING IMAGE NODES (PRESERVE EVERY SINGLE ONE):
+${currentGraph.nodes.map((node) => `- ${node.id}: Step ${node.stepNumber} | Action: "${node.instruction}" | Flows: [${node.metadata.flowsConnected.join(", ")}]`).join("\n")}
+
+EXISTING EDGES (PRESERVE EVERY SINGLE ONE):
+${currentGraph.edges.map((edge) => `- ${edge.from} → ${edge.to}: ${edge.action} | ${edge.description}`).join("\n")}
+
+EXISTING FLOWS (PRESERVE EVERY SINGLE ONE):
+${currentGraph.flows?.map((flow) => `- ${flow.id}: ${flow.name} (${flow.flowType}) | Images: [${flow.imageNodes.join(", ")}]`).join("\n") || "No existing flows"}
+
+🚨 CRITICAL: Your response replaces everything. Include ALL existing items above PLUS the new page navigation.
+**NEVER REMOVE OR MODIFY** any of the above data - only add new content.
+
+🔍 COMPLETE NAVIGATION GRAPH VERIFICATION:
+Before finalizing your response, verify that:
+1. **EVERY PAGE STATE** from the navigation history is included in at least one flow
+2. **ALL NAVIGATION EDGES** have complete labels describing the page transitions
+3. **ALL FLOWS** cover the complete navigation journey from start to end
+4. **NO PAGE STATES** are left out or missing from flows
+5. **COMPLETE NAVIGATION TIMELINE** is maintained from first page to final page
+
+🎯 YOUR GOAL: Create a COMPLETE navigation graph that shows the ENTIRE page-to-page journey with EVERY page state included in appropriate flows.
+`
+    : "No existing graph - creating first navigation relationship."
+}
+
+🌍 PAGE TRANSITION NODE REQUIREMENTS:
+Create a new node for the target page with these specifications:
+- **ID**: "page_transition_${this.generateImageHashFromData(targetUrl)}"
+- **imageName**: Same as ID
+- **imageData**: Use placeholder URL: "${pageTransitionImageUrl}"
+- **instruction**: "${navigationAction}"
+- **stepNumber**: ${(sourcePageStore.actionHistory.length || 0) + 1}
+- **metadata**: 
+  - visibleElements: ["New page loading", "Page transition", "Target page content"]
+  - clickableElements: []
+  - flowsConnected: ["inter_page_navigation_flow"]
+  - dialogsOpen: []
+  - timestamp: Current ISO timestamp
+  - pageTitle: Extract from target URL or use "Navigation Target"
+
+🔗 NAVIGATION EDGE REQUIREMENTS:
+Create an edge connecting the source page to target page:
+- **from**: Last action node from source page OR "step_0_initial" if no actions
+- **to**: The new page transition node ID
+- **action**: "navigate_to_new_page"
+- **instruction**: "${navigationAction}"
+- **description**: "User navigates from ${sourceUrl} to ${targetUrl} via ${navigationAction}"
+- **flowId**: "inter_page_navigation_flow"
+
+🌊 NAVIGATION FLOW REQUIREMENTS:
+Create or update the "Inter-Page Navigation Flow":
+- **id**: "inter_page_navigation_flow"
+- **name**: "Inter-Page Navigation Journey"
+- **description**: "Cross-page navigation tracking user movement between different URLs"
+- **flowType**: "branching"
+- Include both source and target page nodes
+
+🔥 CRITICAL REQUIREMENTS:
+1. **PRESERVE EVERYTHING**: Include ALL existing nodes, edges, flows exactly as they are
+2. **ADD PAGE TRANSITION**: Create new node for target page with placeholder image
+3. **CREATE NAVIGATION LINK**: Connect source to target via navigation edge
+4. **MAINTAIN FLOW STRUCTURE**: Keep all existing flows and add navigation flow
+5. **NO DATA LOSS**: Your response completely replaces existing graph
+6. **STANDARD NAMING**: Use consistent ID patterns for page transitions
+
+🚨 FINAL PRESERVATION WARNING:
+**YOUR RESPONSE MUST CONTAIN EVERY SINGLE EXISTING ITEM PLUS NEW CONTENT.**
+**NEVER DELETE, MODIFY, OR REORGANIZE EXISTING DATA.**
+**ONLY ADD NEW DISCOVERIES TO THE COMPLETE EXISTING STRUCTURE.**`;
+
+      // Use a simple prompt for page navigation without complex image analysis
+      const messages = [
+        {
+          role: "user" as const,
+          content: [
+            {
+              type: "text" as const,
+              text: `Create a navigation graph showing the transition from ${sourceUrl} to ${targetUrl} via action: "${navigationAction}".
+
+🚨 CRITICAL PRESERVATION:
+- Include ALL existing nodes, edges, and flows EXACTLY as they are
+- Add new page transition node with placeholder image
+- Create navigation edge connecting the pages
+- Maintain all existing flow structures
+
+${currentGraph ? "UPDATE the existing graph preserving ALL data while adding the page navigation." : "CREATE new graph with the page navigation relationship."}`,
+            },
+          ],
+        },
+      ];
+
+      // Use generateObject for robust parsing
+      const response = await generateObject({
+        model: vertex("gemini-2.5-flash"),
+        system: systemPrompt,
+        maxTokens: 6000,
+        messages,
+        schema: InteractionGraphSchema,
+      });
+
+      const graph = response.object as InteractionGraph;
+
+      // Validate structure
+      if (!graph.nodes || !graph.edges || !graph.flows) {
+        throw new Error("Invalid navigation graph structure");
+      }
+
+      // Map real image data for existing nodes
+      const imageDataMap = new Map<string, string>();
+
+      // Add initial screenshot
+      imageDataMap.set("step_0_initial", sourcePageStore.initialScreenshot);
+
+      // Add action screenshots from source page
+      sourcePageStore.actionHistory.forEach((action) => {
+        imageDataMap.set(action.imageName, action.after_act);
+      });
+
+      // Update nodes with real image data (except page transition node which keeps placeholder)
+      graph.nodes.forEach((node) => {
+        if (node.id.startsWith("page_transition_")) {
+          // Keep the placeholder image for page transitions
+          node.imageData = pageTransitionImageUrl;
+        } else {
+          const realImageData =
+            imageDataMap.get(node.imageName) || imageDataMap.get(node.id);
+          if (realImageData) {
+            node.imageData = realImageData;
+          } else {
+            logger.warn(
+              `⚠️ No image data found for navigation node: ${node.imageName}`
+            );
+            node.imageData =
+              "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg==";
+          }
+        }
+      });
+
+      logger.info(`📊 Generated page navigation graph`, {
+        sourceUrl,
+        targetUrl,
+        navigationAction,
+        totalNodes: graph.nodes.length,
+        totalEdges: graph.edges.length,
+        totalFlows: graph.flows.length,
+        preservedFromExisting: currentGraph
+          ? {
+              nodes: currentGraph.nodes.length,
+              edges: currentGraph.edges.length,
+              flows: currentGraph.flows?.length || 0,
+            }
+          : "new_navigation_graph",
+      });
+
+      return graph;
+    } catch (error) {
+      logger.error("❌ Failed to generate page navigation graph", {
+        error: error instanceof Error ? error.message : String(error),
+        sourceUrl,
+        targetUrl,
+        navigationAction,
+      });
+      return null;
+    }
+  }
+
+  /**
+   * UNIFIED GRAPH GENERATION METHOD
+   * Handles both interaction graphs (same page) and page navigation graphs (page changes)
+   * This combines the functionality of generateInteractionGraph and generatePageChangeNavigationGraph
+   */
+  async generateUnifiedInteractionGraph(
+    globalStore: PageStore,
+    currentGraph: InteractionGraph | undefined,
+    options?: {
+      isPageNavigation?: boolean;
+      navigationAction?: string;
+      sourceUrl?: string;
+      targetUrl?: string;
+    }
+  ): Promise<InteractionGraph | null> {
+    try {
+      const isPageNavigation = options?.isPageNavigation || false;
+
+      if (
+        isPageNavigation &&
+        options?.navigationAction &&
+        options?.sourceUrl &&
+        options?.targetUrl
+      ) {
+        // Handle page navigation case with enhanced naming
+        return this.generatePageChangeNavigationGraph(
+          globalStore,
+          currentGraph,
+          options.navigationAction,
+          options.sourceUrl,
+          options.targetUrl
+        );
+      } else {
+        // Handle same-page interaction case with enhanced naming
+        return this.generateInteractionGraph(globalStore, currentGraph);
+      }
+    } catch (error) {
+      logger.error("❌ Failed to generate unified interaction graph", {
+        error: error instanceof Error ? error.message : String(error),
+        url: globalStore.url,
+        isPageNavigation: options?.isPageNavigation || false,
+      });
+      return null;
+    }
+  }
+
+  /**
+   * SMART IMAGE HANDLING FOR NODES
+   * Handles both page navigation and interaction nodes
+   */
+  private handleNodeImageData(
+    node: ImageNode,
+    imageDataMap: Map<string, string>,
+    pageTransitionImageUrl?: string
+  ): void {
+    // Case 1: Node already has a URL - preserve it
+    if (node.imageData.startsWith("http")) {
+      return;
+    }
+
+    // Case 2: Page transition node - use transition image
+    if (pageTransitionImageUrl && node.id.startsWith("page_transition_")) {
+      node.imageData = pageTransitionImageUrl;
+      return;
+    }
+
+    // Case 3: Try to find real image data
+    const realImageData =
+      imageDataMap.get(node.imageName) || imageDataMap.get(node.id);
+    if (realImageData) {
+      node.imageData = realImageData;
+      return;
+    }
+
+    // Case 4: If node has URL metadata, use that instead of placeholder
+    if ((node.metadata as any)?.url) {
+      node.imageData = (node.metadata as any).url;
+      return;
+    }
+
+    // Case 5: Fallback to transparent pixel
+    logger.warn(`⚠️ No image data found for node: ${node.imageName}`);
+    node.imageData =
+      "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg==";
+  }
+
+  /**
+   * ENHANCED FLOW AND EDGE NAMING GUIDELINES
+   */
+  private readonly flowNamingGuidelines = `
+🎯 FLOW NAMING EXCELLENCE GUIDE:
+
+1. ANALYZE VISUAL CONTENT IN IMAGES:
+- Look at the actual UI elements and content shown
+- Understand the user's goal from the visual context
+- Consider the application domain and purpose
+
+2. CREATE DESCRIPTIVE FLOW NAMES:
+✅ "Product Image Upload and Gallery Management"
+✅ "Multi-step User Registration with Email Verification"
+✅ "Advanced Search Configuration and Results Filtering"
+✅ "Team Member Invitation and Role Assignment"
+✅ "Project Settings and Collaboration Setup"
+
+3. EDGE NAMING BEST PRACTICES:
+- Describe the EXACT action and its impact
+- Include visual feedback or state changes
+- Reference specific UI elements clicked
+
+Examples:
+✅ "Click 'Upload' button to open file selection dialog"
+✅ "Select 'Team' from dropdown to view team management panel"
+✅ "Enter search query 'typescript' to filter results"
+✅ "Toggle 'Dark Mode' switch to change theme"
+✅ "Click 'Next' to proceed to payment details"
+
+4. FLOW CATEGORIZATION:
+🔐 Authentication Flows:
+- "Complete User Authentication with 2FA"
+- "Password Reset and Account Recovery"
+
+📝 Content Management:
+- "Rich Text Content Creation and Publishing"
+- "Media Library Organization and Tagging"
+
+⚙️ Configuration:
+- "System Preferences and Account Settings"
+- "Notification Rules Configuration"
+
+👥 User Management:
+- "Team Member Onboarding and Permissions"
+- "User Profile Customization"
+
+🔍 Search & Discovery:
+- "Advanced Search with Filters and Sorting"
+- "Content Discovery and Recommendations"
+
+5. EDGE DETAIL REQUIREMENTS:
+Must include:
+- Specific element interacted with
+- Visual feedback or state change
+- Purpose or outcome of action
+
+Example:
+"Click 'Add Member' button → Opens invitation form with email field highlighted"
+"Select 'Project Type' dropdown → Reveals template options with preview cards"
+"Submit search form → Displays filtered results with matching highlights"
+
+6. VISUAL ANALYSIS FOR NAMING:
+Look for:
+- Modal dialogs and their purpose
+- Form fields and their grouping
+- Navigation patterns
+- Content organization
+- Interactive elements
+- State changes
+- Loading indicators
+- Success/error messages
+
+7. DOMAIN-SPECIFIC NAMING:
+E-commerce:
+- "Product Catalog Browsing and Filtering"
+- "Shopping Cart Management and Checkout"
+
+Project Management:
+- "Task Creation and Assignment Workflow"
+- "Project Timeline and Milestone Setup"
+
+Content Platform:
+- "Content Upload and Publishing Pipeline"
+- "Media Asset Management and Organization"
+
+8. USER GOAL ORIENTATION:
+Always name based on what the user is trying to achieve:
+✅ "Create New Project from Template"
+✅ "Configure Automated Email Notifications"
+✅ "Customize Dashboard Layout and Widgets"
+✅ "Set Up Team Communication Channels"`;
+
+  private readonly edgeNamingGuidelines = `
+🎯 EDGE NAMING EXCELLENCE GUIDE:
+
+1. STRUCTURE: [Action] → [Result] → [Purpose]
+Example: "Click 'Upload' → Opens file dialog → For adding profile picture"
+
+2. VISUAL FEEDBACK:
+Include state changes:
+✅ "Click 'Save' → Button shows loading spinner → Settings updated"
+✅ "Toggle switch → Background changes to green → Feature enabled"
+
+3. ELEMENT SPECIFICITY:
+Reference exact UI:
+✅ "Click blue 'Continue' button in top-right"
+✅ "Select 'High Priority' from status dropdown"
+
+4. CONTEXT AWARENESS:
+Show relationship to flow:
+✅ "Enter project name → Creates new workspace → Starts project setup"
+✅ "Click 'Add Member' → Opens invitation form → For team expansion"
+
+5. USER INTENTION:
+Clarify purpose:
+✅ "Click filter icon → Shows advanced search → To refine results"
+✅ "Select date range → Updates timeline → To view specific period"`;
 }

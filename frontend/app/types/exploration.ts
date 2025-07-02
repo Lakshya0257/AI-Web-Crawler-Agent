@@ -39,10 +39,50 @@ export interface LLMDecision {
 export interface InteractionGraph {
   pageUrl?: string;
   pageSummary: string;
-  nodes: GraphNode[];
-  edges: GraphEdge[];
+  nodes: ImageNode[];
+  edges: ImageEdge[];
+  flows: FlowDefinition[];
   description: string;
   lastUpdated: string;
+}
+
+export interface ImageNode {
+  id: string; // imageName (step_X_hash_Y)
+  imageName: string; // Same as id for consistency
+  imageData: string; // Base64 screenshot data
+  instruction: string; // The action that led to this state
+  stepNumber: number; // Step number when this state was captured
+  metadata: {
+    visibleElements: string[]; // Description of what's visible
+    clickableElements: string[]; // Description of interactive elements
+    flowsConnected: string[]; // Array of flow IDs this image participates in
+    dialogsOpen: string[]; // Any dialogs/modals open
+    pageTitle?: string; // Page title if available
+    timestamp: string; // When this state was captured
+  };
+  position?: {
+    x: number;
+    y: number;
+  };
+}
+
+export interface ImageEdge {
+  from: string; // Source imageName
+  to: string; // Target imageName
+  action: string; // Specific action taken (e.g., "click_upload_button")
+  instruction: string; // Full instruction that caused the transition
+  description: string; // Human-readable description of the transition
+  flowId?: string; // Optional flow this edge belongs to
+}
+
+export interface FlowDefinition {
+  id: string; // Unique flow identifier
+  name: string; // Human-readable flow name (e.g., "Upload Asset Flow")
+  description: string; // What this flow accomplishes
+  startImageName: string; // Initial state of the flow
+  endImageNames: string[]; // Possible end states
+  imageNodes: string[]; // All image nodes in this flow
+  flowType: "linear" | "branching" | "circular"; // Flow pattern type
 }
 
 export interface GraphNode {
