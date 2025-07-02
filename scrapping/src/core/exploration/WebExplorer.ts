@@ -35,7 +35,6 @@ export class WebExplorer {
   private sessionDecisionHistory: any[] = []; // Track all decisions made during the session
   private isExplorationObjective: boolean; // Add exploration mode detection
   private activeProcessingPromises: Map<string, Promise<void>> = new Map(); // Track background processing
-  protected pageLinkages: Map<string, string[]> = new Map(); // Track which page leads to which pages
   private maxPagesToExplore: number; // Maximum pages to explore
   protected socket?: Socket;
   protected userName?: string;
@@ -747,6 +746,19 @@ export class WebExplorer {
       pageData.status = "completed";
       this.fileManager.savePageData(pageData.urlHash, pageData);
 
+      // Generate final graph after page completion (with await)
+      try {
+        logger.info(
+          `📊 Generating final graph for completed page: ${pageData.url}`
+        );
+        await this.startGraphGenerationFlow(pageData.urlHash);
+        logger.info(`✅ Final graph generation completed for: ${pageData.url}`);
+      } catch (error) {
+        logger.error(`❌ Final graph generation failed for: ${pageData.url}`, {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+
       // Emit page completed event
       if (this.socket && this.userName) {
         this.socket.emit("exploration_update", {
@@ -840,17 +852,14 @@ export class WebExplorer {
     if (urlChanged) {
       logger.info(`🔄 URL changed: ${originalUrl} → ${newUrl}`);
 
-      
-
-      this.globalStore.addAction(
-        urlHash,
-        instruction,
-        `data:image/png;base64,${afterActionScreenshot.toString("base64")}`,
-        this.session.globalStepCounter
-      );
-
       // Check if we're in a sensitive flow (login, signup, etc.)
       if (this.session.flowContext.isInSensitiveFlow) {
+        this.globalStore.addAction(
+          urlHash,
+          `${instruction}. In this step, the user has navigated to a new page, but currently in a sensitive flow, so the user will stay on the new page and continue with the flow.`,
+          `data:image/png;base64,${afterActionScreenshot.toString("base64")}`,
+          this.session.globalStepCounter
+        );
         // In sensitive flow - stay on new page, don't navigate back
         logger.info(
           `🔒 Sensitive flow detected - staying on new URL: ${newUrl}`
@@ -858,6 +867,12 @@ export class WebExplorer {
 
         return { newUrl: null, actionResult: actResult };
       } else {
+        this.globalStore.addAction(
+          urlHash,
+          `${instruction}. In this step, the user has navigated to a new page, which will be queued and processed seperately.`,
+          `data:image/png;base64,${afterActionScreenshot.toString("base64")}`,
+          this.session.globalStepCounter
+        );
         // Normal flow - navigate back to original URL for continued processing
         logger.info(`🔙 Navigating back to original URL: ${originalUrl}`);
         await this.page.goto(originalUrl, {
@@ -904,7 +919,7 @@ export class WebExplorer {
 
         // Customize the system prompt
         instructions: `You are a helpful assistant that can use a web browser.
-    Do not ask follow up questions, the user will trust your judgement.`,
+	Do not ask follow up questions, the user will trust your judgement. Also only do that action what user have asked, don't do anything else, if user asked to click a button, then only click that button and complete it immediately, dont click or do anything else. JUST FOLLOW THE INSTRUCTIONS.`,
 
         // Customize the API key
         options: {
@@ -1425,8 +1440,10 @@ Provide comprehensive insights rather than just listing visible elements. Analyz
     try {
       switch (toolName) {
         case "page_act":
-          const actionResult =
-            await this.executeActionAndCheckUrlChange(instruction, pageData.urlHash);
+          const actionResult = await this.executeActionAndCheckUrlChange(
+            instruction,
+            pageData.urlHash
+          );
 
           // Check if user is still active after tool execution
           if (!this.isUserStillActive()) {
@@ -1458,21 +1475,6 @@ Provide comprehensive insights rather than just listing visible elements. Analyz
             // ✅ BOOLEAN FLAG: URL CHANGED - Set right before queuing logic
             const urlChangedFlag = true;
 
-            // 🚀 AUTOMATIC PAGE NAVIGATION GRAPH GENERATION
-            // When URL changes, automatically generate graph with page navigation relationship
-            // this.generatePageNavigationGraph(
-            //   pageData.urlHash,
-            //   instruction,
-            //   pageData.url,
-            //   discoveredUrl
-            // ).catch((error: any) => {
-            //   logger.error("❌ Failed to generate page navigation graph", {
-            //     error,
-            //     sourceUrl: pageData.url,
-            //     targetUrl: discoveredUrl,
-            //   });
-            // });
-
             // Check if we're in a sensitive flow (login, signup, etc.)
             if (this.session.flowContext.isInSensitiveFlow) {
               // In sensitive flow - do NOT queue URL, just continue on new page
@@ -1501,14 +1503,19 @@ Provide comprehensive insights rather than just listing visible elements. Analyz
             step.result = `PREVIOUS_ACTION_RESULT: URL_CHANGED=false, STAYED_ON_SAME_PAGE=true, ACTION_RESULT=${toolResult.success ? "SUCCESS" : "FAILED"}`;
           }
 
-          this.startGraphGenerationFlow(
-            pageData.urlHash
-          ).catch((error) => {
-            logger.error("❌ Background graph generation failed", {
-              error,
+          // Check if graph generation is already in progress
+          if (!this.globalStore.isGraphGenerationInProgress(pageData.urlHash)) {
+            this.startGraphGenerationFlow(pageData.urlHash).catch((error) => {
+              logger.error("❌ Background graph generation failed", {
+                error,
+                urlHash: pageData.urlHash,
+              });
+            });
+          } else {
+            logger.info("⏳ Graph generation already in progress, skipping", {
               urlHash: pageData.urlHash,
             });
-          });
+          }
 
           // Emit specific page_act event
           if (this.socket && this.userName) {
@@ -1728,20 +1735,6 @@ Provide comprehensive insights rather than just listing visible elements. Analyz
       return;
     }
 
-    // Track page linkage for frontend diagram
-    if (sourceUrl) {
-      const sourceUrlHash = FileManager.generateUrlHash(sourceUrl);
-      if (!this.pageLinkages.has(sourceUrlHash)) {
-        this.pageLinkages.set(sourceUrlHash, []);
-      }
-      this.pageLinkages.get(sourceUrlHash)!.push(url);
-
-      logger.info("🔗 Page linkage recorded", {
-        from: sourceUrl,
-        to: url,
-      });
-    }
-
     // Create page data
     const pageData: PageData = {
       url,
@@ -1803,46 +1796,6 @@ Provide comprehensive insights rather than just listing visible elements. Analyz
   }
 
   /**
-   * Save page linkages for frontend diagram
-   */
-  private savePageLinkages(): void {
-    // Convert Map to a serializable object for frontend consumption
-    const linkagesObject = Object.fromEntries(
-      Array.from(this.pageLinkages.entries()).map(([source, targets]) => [
-        source,
-        targets,
-      ])
-    );
-
-    // Create the linkages data structure
-    const linkagesData = {
-      sessionId: this.session.metadata.sessionId,
-      timestamp: new Date().toISOString(),
-      totalSources: this.pageLinkages.size,
-      totalLinkages: Array.from(this.pageLinkages.values()).reduce(
-        (sum, targets) => sum + targets.length,
-        0
-      ),
-      linkages: linkagesObject,
-    };
-
-    // Save to file system using FileManager pattern
-    const linkagesPath = path.join(
-      this.fileManager["sessionDir"],
-      "page-linkages.json"
-    );
-    fs.writeFileSync(linkagesPath, JSON.stringify(linkagesData, null, 2));
-
-    logger.info("💾 Page linkages saved", {
-      totalSources: this.pageLinkages.size,
-      totalLinkages: Array.from(this.pageLinkages.values()).reduce(
-        (sum, targets) => sum + targets.length,
-        0
-      ),
-    });
-  }
-
-  /**
    * Finalize exploration session
    */
   protected async finalizeSession(
@@ -1861,9 +1814,6 @@ Provide comprehensive insights rather than just listing visible elements. Analyz
       this.sessionDecisionHistory
     );
 
-    // Save page linkages for frontend diagram
-    this.savePageLinkages();
-
     this.saveSession();
 
     // Emit session completion with linkages
@@ -1876,7 +1826,6 @@ Provide comprehensive insights rather than just listing visible elements. Analyz
           objectiveAchieved,
           totalPages: this.session.metadata.totalPagesDiscovered,
           totalActions: this.session.metadata.totalActionsExecuted,
-          pageLinkages: Object.fromEntries(this.pageLinkages.entries()),
           sessionId: this.session.metadata.sessionId,
           duration: `${duration}ms`,
         },
@@ -1896,85 +1845,13 @@ Provide comprehensive insights rather than just listing visible elements. Analyz
   }
 
   /**
-   * Automatic page navigation graph generation when URL changes
-   * Bypasses Gemini confirmation and directly generates navigation relationship
-   */
-  private async generatePageNavigationGraph(
-    sourceUrlHash: string,
-    navigationAction: string,
-    sourceUrl: string,
-    targetUrl: string
-  ): Promise<void> {
-    try {
-      logger.info(`🔗 Generating page navigation graph`, {
-        sourceUrl,
-        targetUrl,
-        action: navigationAction,
-      });
-
-      // Get current graph for source page from GlobalStore
-      const sourcePageStore = this.globalStore.getPageStore(sourceUrlHash);
-      if (!sourcePageStore) {
-        logger.warn(`⚠️ No page store found for source URL: ${sourceUrl}`);
-        return;
-      }
-
-      const currentGraph = sourcePageStore.graph;
-
-      // Use unified graph generation for page navigation
-      const updatedGraph = await this.llmClient.generateUnifiedInteractionGraph(
-        sourcePageStore,
-        currentGraph,
-        {
-          isPageNavigation: true,
-          navigationAction,
-          sourceUrl,
-          targetUrl,
-        }
-      );
-
-      if (updatedGraph) {
-        // Store updated graph
-        this.globalStore.updateGraph(sourceUrlHash, updatedGraph);
-
-        // Emit graph update event
-        if (this.socket && this.userName) {
-          this.socket.emit("exploration_update", {
-            type: "graph_updated",
-            timestamp: new Date().toISOString(),
-            data: {
-              userName: this.userName,
-              urlHash: sourceUrlHash,
-              graph: updatedGraph,
-              updateReason: "page_navigation",
-              navigationTarget: targetUrl,
-            },
-          });
-        }
-
-        logger.info(`✅ Page navigation graph updated`, {
-          sourceUrl,
-          targetUrl,
-          nodes: updatedGraph.nodes.length,
-          edges: updatedGraph.edges.length,
-        });
-      }
-    } catch (error: any) {
-      logger.error(`❌ Failed to generate page navigation graph`, {
-        error: error.message,
-        sourceUrl,
-        targetUrl,
-      });
-    }
-  }
-
-  /**
    * Start non-blocking graph generation flow
    */
-  private async startGraphGenerationFlow(
-    urlHash: string,
-  ): Promise<void> {
+  private async startGraphGenerationFlow(urlHash: string): Promise<void> {
     try {
+      // Set flag to indicate graph generation is in progress
+      this.globalStore.setGraphGenerationInProgress(urlHash, true);
+
       // Step 1: Emit "updating graph" event
       this.globalStore.emitGraphUpdating(urlHash);
 
@@ -1990,7 +1867,7 @@ Provide comprehensive insights rather than just listing visible elements. Analyz
 
       // Generate new graph with unified method
       logger.info(`📊 Generating interaction graph for: ${pageStore.url}`);
-      const newGraph = await this.llmClient.generateUnifiedInteractionGraph(
+      const newGraph = await this.llmClient.generateInteractionGraph(
         pageStore,
         currentGraph
       );
@@ -2011,6 +1888,9 @@ Provide comprehensive insights rather than just listing visible elements. Analyz
         error: error instanceof Error ? error.message : String(error),
         urlHash,
       });
+    } finally {
+      // Always reset the flag, even if an error occurred
+      this.globalStore.setGraphGenerationInProgress(urlHash, false);
     }
   }
 

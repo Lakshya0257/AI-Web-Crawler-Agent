@@ -80,6 +80,7 @@ export interface PageStore {
   conversationHistory: Array<{ role: "user" | "assistant"; content: string }>;
   graph?: InteractionGraph;
   lastUpdated: string;
+  isGraphGenerationInProgress: boolean;
 }
 
 export class GlobalStore {
@@ -106,7 +107,8 @@ export class GlobalStore {
         initialScreenshot,
         actionHistory: [],
         conversationHistory: [],
-        lastUpdated: new Date().toISOString()
+        lastUpdated: new Date().toISOString(),
+        isGraphGenerationInProgress: false
       };
       
       this.store.set(urlHash, pageStore);
@@ -262,6 +264,35 @@ export class GlobalStore {
   }
 
   /**
+   * Check if graph generation is in progress for a page
+   */
+  isGraphGenerationInProgress(urlHash: string): boolean {
+    const pageStore = this.store.get(urlHash);
+    return pageStore?.isGraphGenerationInProgress || false;
+  }
+
+  /**
+   * Set graph generation status for a page
+   */
+  setGraphGenerationInProgress(urlHash: string, inProgress: boolean): void {
+    const pageStore = this.store.get(urlHash);
+    if (!pageStore) {
+      logger.warn(`⚠️ Page store not found for urlHash: ${urlHash}`);
+      return;
+    }
+
+    pageStore.isGraphGenerationInProgress = inProgress;
+    pageStore.lastUpdated = new Date().toISOString();
+    this.saveStore();
+
+    logger.info(`🔄 Graph generation status updated`, {
+      urlHash,
+      inProgress,
+      url: pageStore.url
+    });
+  }
+
+  /**
    * Save store to file system
    */
   private saveStore(): void {
@@ -308,6 +339,10 @@ export class GlobalStore {
         
         if (storeData.pages) {
           Object.entries(storeData.pages).forEach(([urlHash, pageData]: [string, any]) => {
+            // Add backward compatibility for new boolean field
+            if (pageData.isGraphGenerationInProgress === undefined) {
+              pageData.isGraphGenerationInProgress = false;
+            }
             this.store.set(urlHash, pageData as PageStore);
           });
           

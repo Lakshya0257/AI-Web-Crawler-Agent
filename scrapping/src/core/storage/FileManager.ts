@@ -213,6 +213,38 @@ export class FileManager {
   }
 
   /**
+   * Save raw LLM response with versioning
+   */
+  saveRawLLMResponse(
+    urlHash: string,
+    version: string,
+    responseType: string,
+    rawResponse: string
+  ): string {
+    const filename = `${responseType}_${version}.txt`;
+    const responsePath = path.join(
+      this.sessionDir,
+      "urls",
+      urlHash,
+      "llm_responses",
+      filename
+    );
+
+    // Create llm_responses directory if it doesn't exist
+    const responseDir = path.join(
+      this.sessionDir,
+      "urls",
+      urlHash,
+      "llm_responses"
+    );
+    fs.mkdirSync(responseDir, { recursive: true });
+
+    fs.writeFileSync(responsePath, rawResponse);
+
+    return responsePath;
+  }
+
+  /**
    * Save decision context for debugging and analysis
    */
   saveDecisionContext(

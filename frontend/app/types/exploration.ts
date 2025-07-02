@@ -10,7 +10,14 @@ export interface ExplorationConfig {
 
 export interface InputRequest {
   inputKey: string;
-  inputType: 'text' | 'email' | 'password' | 'url' | 'otp' | 'phone' | 'boolean';
+  inputType:
+    | "text"
+    | "email"
+    | "password"
+    | "url"
+    | "otp"
+    | "phone"
+    | "boolean";
   inputPrompt: string;
 }
 
@@ -29,7 +36,7 @@ export interface UserInputResponse {
 }
 
 export interface LLMDecision {
-  tool: 'page_act' | 'user_input' | 'standby';
+  tool: "page_act" | "user_input" | "standby";
   instruction: string;
   reasoning: string;
   nextPlan: string;
@@ -87,7 +94,17 @@ export interface FlowDefinition {
 
 export interface GraphNode {
   id: string;
-  type: 'button' | 'link' | 'input' | 'dropdown' | 'toggle' | 'tab' | 'section' | 'state' | 'dialog' | 'navigation_target';
+  type:
+    | "button"
+    | "link"
+    | "input"
+    | "dropdown"
+    | "toggle"
+    | "tab"
+    | "section"
+    | "state"
+    | "dialog"
+    | "navigation_target";
   label: string;
   description: string;
   selector?: string;
@@ -107,10 +124,10 @@ export interface GraphEdge {
 
 export interface ChatMessage {
   id: string;
-  type: 'user' | 'assistant';
+  type: "user" | "assistant";
   content: string;
   timestamp: string;
-  requestType?: 'task_specific' | 'exploration' | 'question';
+  requestType?: "task_specific" | "exploration" | "question";
 }
 
 export interface ChatState {
@@ -173,7 +190,7 @@ export interface PageStatus {
   userName: string;
   url: string;
   urlHash: string;
-  status: 'in_progress' | 'completed';
+  status: "in_progress" | "completed";
   stepsExecuted?: number;
   timestamp: string;
   hasGraph?: boolean;
@@ -185,19 +202,31 @@ export interface SessionCompletion {
   objectiveAchieved: boolean;
   totalPages: number;
   totalActions: number;
-  pageLinkages: Record<string, string[]>;
   sessionId: string;
   duration: string;
   timestamp: string;
 }
 
 export interface ExplorationUpdate {
-  type: 'page_started' | 'page_completed' | 'llm_decision' | 'tool_execution_started' | 
-        'tool_execution_completed' | 'after_page_act' | 'page_act_result' | 'url_discovered' | 
-        'screenshot_captured' | 'session_completed' | 'user_input_request' | 
-        'user_input_received' | 'standby_completed' | 
-        'updating_graph' | 'graph_updated' | 
-        'chat_message' | 'chat_navigation' | 'chat_error';
+  type:
+    | "page_started"
+    | "page_completed"
+    | "llm_decision"
+    | "tool_execution_started"
+    | "tool_execution_completed"
+    | "after_page_act"
+    | "page_act_result"
+    | "url_discovered"
+    | "screenshot_captured"
+    | "session_completed"
+    | "user_input_request"
+    | "user_input_received"
+    | "standby_completed"
+    | "updating_graph"
+    | "graph_updated"
+    | "chat_message"
+    | "chat_navigation"
+    | "chat_error";
   timestamp: string;
   data: any;
 }
@@ -233,4 +262,4 @@ export interface ExplorationState {
   graphs: { [urlHash: string]: InteractionGraph };
   chatState: ChatState;
   isGraphUpdating: boolean;
-} 
+}

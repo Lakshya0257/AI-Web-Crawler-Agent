@@ -31,9 +31,9 @@
   "author": "Your Name",
   "license": "MIT",
   "dependencies": {
-    "@ai-sdk/google-vertex": "^2.2.26",
     "@ai-sdk/anthropic": "^1.2.12",
     "@ai-sdk/google": "^1.2.21",
+    "@ai-sdk/google-vertex": "^2.2.26",
     "@ai-sdk/openai": "^1.0.10",
     "@anthropic-ai/sdk": "^0.55.1",
     "@browserbasehq/stagehand": "^2.4.0",
@@ -46,7 +46,7 @@
     "zod": "^3.24.1"
   },
   "devDependencies": {
-    "@types/node": "^22.10.2",
+    "@types/node": "^22.16.0",
     "typescript": "^5.7.2"
   },
   "engines": {

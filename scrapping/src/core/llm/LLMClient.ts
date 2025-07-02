@@ -3,6 +3,9 @@ import { vertex } from "@ai-sdk/google-vertex";
 import { anthropic } from "@ai-sdk/anthropic";
 import sharp from "sharp";
 import { z } from "zod";
+import fs from "fs";
+import path from "path";
+import crypto from "crypto";
 import logger from "../../utils/logger.js";
 import { FileManager } from "../storage/FileManager.js";
 import {
@@ -43,6 +46,53 @@ const ImageNodeMetadataSchema = z
   .describe(
     "Complete metadata - NEVER omit any fields, use empty arrays if needed"
   );
+
+// 🔧 ZOD SCHEMAS FOR LLM DECISION RESPONSE
+const InputRequestSchema = z.object({
+  inputKey: z.string().describe("Unique identifier for the input"),
+  inputType: z
+    .enum(["text", "email", "password", "url", "otp", "phone", "boolean"])
+    .describe("Type of input required"),
+  inputPrompt: z.string().describe("User-friendly prompt for the input"),
+});
+
+const ToolParametersSchema = z.object({
+  instruction: z.string().describe("Specific instruction for the tool"),
+  inputKey: z
+    .string()
+    .optional()
+    .describe("For single input (backward compatibility)"),
+  inputType: z
+    .enum(["text", "email", "password", "url", "otp", "phone", "boolean"])
+    .optional()
+    .describe("Type of single input"),
+  inputPrompt: z.string().optional().describe("Prompt for single input"),
+  sensitive: z.boolean().optional().describe("Whether this input is sensitive"),
+  inputs: z
+    .array(InputRequestSchema)
+    .optional()
+    .describe("For multiple inputs"),
+  waitTimeSeconds: z.number().optional().describe("Wait time for standby tool"),
+});
+
+const LLMDecisionResponseSchema = z.object({
+  reasoning: z.string().describe("Detailed reasoning for the decision"),
+  tool_to_use: z
+    .enum(["page_act", "user_input", "standby"])
+    .describe("Which tool to use next"),
+  tool_parameters: ToolParametersSchema.describe(
+    "Parameters for the selected tool"
+  ),
+  isCurrentPageExecutionCompleted: z
+    .boolean()
+    .describe(
+      "Whether current page exploration is complete, first ask to user if the current page is completed or not, as a user_input tool of boolean WHEN YOU ARE SETTING THIS TO TRUE, CALL STANDBY TOOL WITH 1 SEC WAIT TIME. (COMPULSORY)"
+    ),
+  isInSensitiveFlow: z
+    .boolean()
+    .optional()
+    .describe("Whether currently in a sensitive flow"),
+});
 
 const ImageNodeSchema = z.object({
   id: z
@@ -133,13 +183,166 @@ export class LLMClient {
     // Vertex AI authentication should be set up via Application Default Credentials
 
     // Initialize Vertex AI model (Gemini)
-    this.model = vertex("gemini-1.5-pro");
+    this.model = vertex("gemini-2.5-pro");
 
     // Initialize Claude model for graph generation
     this.claudeModel = anthropic("claude-4-sonnet-20250514");
 
     this.additionalContext = additionalContext;
     this.canLogin = canLogin;
+  }
+
+  /**
+   * Get next version number for raw LLM responses
+   */
+  private getNextResponseVersion(urlHash: string): string {
+    //create ramdom hash
+    const randomHash = crypto.randomUUID();
+
+    return randomHash;
+  }
+
+  /**
+   * Extract JSON from LLM response with robust safety measures
+   */
+  private extractJsonFromResponse(rawResponse: string): string {
+    try {
+      // Remove any leading/trailing whitespace
+      let cleaned = rawResponse.trim();
+
+      // Strategy 1: Check if it's already clean JSON (starts with { and ends with })
+      if (cleaned.startsWith("{") && cleaned.endsWith("}")) {
+        logger.debug("JSON extraction: Using Strategy 1 (already clean)");
+        return cleaned;
+      }
+
+      // Strategy 2: Extract JSON from markdown code blocks (multiple patterns)
+      const markdownPatterns = [
+        /```(?:json)?\s*(\{[\s\S]*?\})\s*```/, // Standard markdown json blocks
+        /```\s*(\{[\s\S]*?\})\s*```/, // Markdown blocks without language
+        /~~~(?:json)?\s*(\{[\s\S]*?\})\s*~~~/, // Alternative markdown syntax
+      ];
+
+      for (const pattern of markdownPatterns) {
+        const match = cleaned.match(pattern);
+        if (match && match[1]) {
+          logger.debug("JSON extraction: Using Strategy 2 (markdown blocks)");
+          return match[1].trim();
+        }
+      }
+
+      // Strategy 3: Look for JSON between any backticks
+      const backtickMatch = cleaned.match(/`+\s*(\{[\s\S]*?\})\s*`+/);
+      if (backtickMatch && backtickMatch[1]) {
+        logger.debug("JSON extraction: Using Strategy 3 (backticks)");
+        return backtickMatch[1].trim();
+      }
+
+      // Strategy 4: Find the first { and last } to extract JSON block
+      const firstBrace = cleaned.indexOf("{");
+      const lastBrace = cleaned.lastIndexOf("}");
+
+      if (firstBrace !== -1 && lastBrace !== -1 && firstBrace < lastBrace) {
+        const extracted = cleaned.substring(firstBrace, lastBrace + 1);
+        return extracted;
+      }
+
+      // Strategy 5: Try to find JSON after common prefixes
+      const prefixes = [
+        "Here is the JSON:",
+        "Here's the JSON:",
+        "JSON:",
+        "Response:",
+        "Result:",
+        "Output:",
+        "\n",
+        "\r\n",
+      ];
+
+      for (const prefix of prefixes) {
+        const prefixIndex = cleaned.toLowerCase().indexOf(prefix.toLowerCase());
+        if (prefixIndex !== -1) {
+          const afterPrefix = cleaned
+            .substring(prefixIndex + prefix.length)
+            .trim();
+          if (afterPrefix.startsWith("{")) {
+            const firstBrace = afterPrefix.indexOf("{");
+            const lastBrace = afterPrefix.lastIndexOf("}");
+            if (
+              firstBrace !== -1 &&
+              lastBrace !== -1 &&
+              firstBrace < lastBrace
+            ) {
+              return afterPrefix.substring(firstBrace, lastBrace + 1);
+            }
+          }
+        }
+      }
+
+      // Strategy 6: Remove common non-JSON prefixes and suffixes
+      const patterns = [
+        /^[^{]*(\{[\s\S]*\})[^}]*$/, // Extract everything between first { and last }
+        /^.*?(\{[\s\S]*?\}).*$/, // Extract first complete JSON object
+      ];
+
+      for (const pattern of patterns) {
+        const match = cleaned.match(pattern);
+        if (match && match[1]) {
+          return match[1].trim();
+        }
+      }
+
+      // Strategy 7: Handle broken JSON with mismatched braces
+      if (cleaned.includes("{")) {
+        try {
+          // Find all potential JSON objects and try to parse each
+          let braceCount = 0;
+          let startIndex = -1;
+          let potentialJsons = [];
+
+          for (let i = 0; i < cleaned.length; i++) {
+            if (cleaned[i] === "{") {
+              if (braceCount === 0) {
+                startIndex = i;
+              }
+              braceCount++;
+            } else if (cleaned[i] === "}") {
+              braceCount--;
+              if (braceCount === 0 && startIndex !== -1) {
+                const potentialJson = cleaned.substring(startIndex, i + 1);
+                potentialJsons.push(potentialJson);
+                startIndex = -1;
+              }
+            }
+          }
+
+          // Try to parse each potential JSON, return the first successful one
+          for (const jsonCandidate of potentialJsons) {
+            try {
+              JSON.parse(jsonCandidate);
+              return jsonCandidate;
+            } catch {
+              // Continue to next candidate
+            }
+          }
+        } catch {
+          // Fall through to next strategy
+        }
+      }
+
+      // If all strategies fail, return the cleaned response and let JSON.parse handle the error
+      logger.warn("Could not extract clean JSON from response, trying as-is", {
+        rawResponsePreview: cleaned.substring(0, 200),
+      });
+
+      return cleaned;
+    } catch (error) {
+      logger.error("Error in extractJsonFromResponse", {
+        error: error instanceof Error ? error.message : String(error),
+        rawResponsePreview: rawResponse.substring(0, 200),
+      });
+      return rawResponse; // Return original if extraction fails
+    }
   }
 
   private getRecentActions(
@@ -293,37 +496,88 @@ Our exploration system works as follows:
 ${
   isExplorationObjective
     ? `
-EXPLORATION MODE ACTIVATED:
-Since this is an exploration objective, your strategy should be:
-1. EXPLORE THE CURRENT PAGE COMPLETELY: Click ALL visible buttons, filters, dropdowns, toggles, tabs, and interactive elements
-2. THOROUGH INTERACTION: Don't assume what elements do - actually interact with them to see their behavior
-3. FOCUS ON SCREENSHOT: Base decisions strictly on what you can see in the screenshot, don't assume functionality
-4. SEQUENTIAL EXPLORATION: Explore one element at a time, observing the changes after each interaction
-5. DISCOVER NEW PAGES: Click on links that lead to new pages to register them for future processing
+🚀 EXPLORATION MODE ACTIVATED - MAXIMUM THOROUGHNESS REQUIRED:
+Since this is an exploration objective, your strategy MUST be:
 
-For exploration:
-- Click every button, filter, dropdown, tab, toggle, and interactive element you can see
-- Observe how each interaction changes the page state
-- Don't assume functionality - test it by interacting
-- Scroll the page as needed to reveal more content/links
-- If you see forms, try interacting with form elements (but get confirmation before submitting)
-- Example: If you see a dropdown, click it to see what options are available
+1. 🎯 COMPREHENSIVE EXPLORATION MANDATE: You MUST click/hover/interact with EVERY SINGLE visible interactive element
+2. 🔍 LEAVE NO STONE UNTURNED: Every button, link, dropdown, toggle, tab, filter, checkbox, radio button, slider, etc.
+3. 📊 100% INTERACTION COVERAGE: The exploration is NOT complete until EVERY possibility has been tested
+4. 🚫 NEVER ASSUME: Don't assume what elements do - ALWAYS interact to discover their actual behavior
+5. 📝 SYSTEMATIC APPROACH: Go through elements systematically - top to bottom, left to right
+
+🎯 MANDATORY EXPLORATION CHECKLIST:
+✅ ALL navigation links (primary navigation, footer links, breadcrumbs)
+✅ ALL buttons (submit, action, CTA, utility buttons)
+✅ ALL dropdown menus (click to see all options, then select different values)
+✅ ALL tabs (switch between every tab to see different content)
+✅ ALL toggles and switches (turn on/off to see state changes)
+✅ ALL filters and sorting options (apply different filters to see results)
+✅ ALL checkboxes and radio buttons (select/deselect to see effects)
+✅ ALL form fields (click into them to see input behaviors)
+✅ ALL search boxes (try typing to see autocomplete/suggestions)
+✅ ALL expandable sections (expand/collapse to see hidden content)
+✅ ALL modal triggers (open modals/dialogs to explore their content)
+✅ ALL hover effects (hover over elements to reveal hidden options)
+✅ ALL scroll areas (scroll to reveal more content or options)
+✅ ALL tooltips and help icons (hover to see additional information)
+
+⚡ SMART INTERACTION STRATEGY:
+- Start with SAFE interactions first (view-only elements)
+- Then progress to POTENTIALLY MODIFYING interactions (but get confirmation first)
+- Test ONE example from each TYPE of similar elements (smart content selection)
+- Document what each interaction reveals about functionality
+
+🔄 COMPLETION CRITERIA:
+The page exploration is ONLY complete when:
+- Every visible interactive element has been tested at least once
+- All dropdown options have been explored
+- All tabs/sections have been viewed
+- All form fields have been interacted with (safely)
+- All navigation paths have been discovered
+- No more untested interactive elements remain visible
+- You should never conclude page while executing page_act tool, after you think each task is done, ask from user to conclude this page or not, if yes then conclude this page with standby tool of 1 sec.
+
+🚨 NEVER SET isCurrentPageExecutionCompleted = true UNTIL:
+- You have methodically gone through EVERY interactive element
+- You have tested ALL functionality visible on the page
+- You have discovered ALL possible navigation paths
+- There are NO MORE untested elements remaining
+- User have said true from user_input tool (necessary)
 `
     : `
-TASK-FOCUSED MODE:
-Since this is a specific task objective, your strategy should be:
-1. EXPLORE THE CURRENT PAGE COMPLETELY: Click ALL visible buttons, filters, dropdowns, toggles, tabs, and interactive elements
-2. THOROUGH INTERACTION: Don't assume what elements do - actually interact with them to see their behavior
-3. FOCUS ON SCREENSHOT: Base decisions strictly on what you can see in the screenshot, don't assume functionality
-4. SEQUENTIAL EXPLORATION: Explore one element at a time, observing the changes after each interaction
-5. GOAL-ORIENTED: While exploring, keep the specific objective in mind and prioritize relevant elements
+🎯 TASK-FOCUSED MODE - THOROUGH EXPLORATION WITH PURPOSE:
+Since this is a specific task objective, your strategy MUST be:
 
-- Click every button, filter, dropdown, tab, toggle, and interactive element you can see
-- Observe how each interaction changes the page state
-- Don't assume functionality - test it by interacting
-- Scroll the page as needed to reveal more content/links
-- If you see forms, try interacting with form elements (but get confirmation before submitting)
-- Example: If you see a dropdown, click it to see what options are available
+1. 🔍 COMPREHENSIVE PAGE EXPLORATION: Click/hover/interact with EVERY visible interactive element
+2. 🎯 GOAL-ORIENTED PRIORITIZATION: While being thorough, prioritize elements relevant to the objective
+3. 🚫 NEVER ASSUME FUNCTIONALITY: Always interact to discover what elements actually do
+4. 📝 SYSTEMATIC COVERAGE: Ensure no interactive element is left untested
+5. 🎪 SMART CONTENT SELECTION: Test one example from each type of similar elements
+
+🔧 MANDATORY INTERACTION REQUIREMENTS:
+✅ ALL buttons, links, and clickable elements
+✅ ALL dropdown menus (open them to see options)
+✅ ALL tabs and navigation elements
+✅ ALL form fields and input elements
+✅ ALL filters, toggles, and controls
+✅ ALL expandable sections and accordions
+✅ ALL modal/dialog triggers
+✅ ALL search and filter interfaces
+
+⚡ TASK-FOCUSED INTERACTION STRATEGY:
+- PRIORITIZE elements that seem relevant to your objective
+- BUT STILL TEST all other interactive elements systematically
+- Use smart content selection (test one project, not all projects)
+- Get confirmation before any data-modifying actions
+- Scroll to reveal more content when needed
+
+🔄 TASK COMPLETION CRITERIA:
+Consider the task/page complete ONLY when:
+- The specific objective has been achieved OR
+- Every possible path to achieve the objective has been explored AND
+- All interactive elements have been tested to understand the full interface
+
+🚨 CRITICAL: Even in task mode, DO NOT skip elements like "Create new canvas" - these might be essential for achieving your objective! Test everything, but get confirmation for actions that create/modify data.
 `
 }
 
@@ -340,7 +594,7 @@ The system has reached its maximum page discovery limit. This means:
 - Focus on extracting information and interacting with elements on the CURRENT page
 - Do NOT expect clicking links to add new pages to the exploration queue
 - Continue with page_extract and page_act as needed for current page objectives
-- After you think all information is extracted, you can end the task by isCurrentPageExecutionCompleted = true
+- After you think all information is extracted, all tasks are done, then call user_input to ask whether we can conclude this page or not, if user said yes then you can end the task by isCurrentPageExecutionCompleted = true
 `
     : ""
 }
@@ -377,62 +631,86 @@ EXAMPLE BAD REASONING:
 
 🚨 MANDATORY CONFIRMATION REQUIRED - NO EXCEPTIONS:
 Before performing ANY action that could manipulate, change, or affect data, you MUST use the user_input tool to get explicit confirmation first!
-Like creating a new task, inviting someone, deleting something, clicking on forget password etc
 
-ACTIONS REQUIRING CONFIRMATION (NON-EXHAUSTIVE LIST):
-🛑 CREATE/REGISTER:
-- Creating accounts/profiles
-- Registering for services
-- Adding items to cart/wishlist
-- Creating posts/comments/reviews
-- Signing up for newsletters
-- Creating any new content
+EXPANDED ACTIONS REQUIRING CONFIRMATION:
+🛑 CREATE/ADD/NEW:
+- Creating accounts/profiles/users
+- Creating new projects/files/documents/canvases
+- Adding new items/content/entries
+- Registering for services/newsletters
+- Creating posts/comments/reviews/tasks
+- Adding items to cart/wishlist/favorites
+- Inviting users/sending invitations
+- Setting up new configurations
+- Starting new processes/workflows
 
-🛑 DELETE/REMOVE:
-- Deleting accounts/profiles
-- Removing items from cart
-- Deleting posts/comments
+🛑 DELETE/REMOVE/CLEAR:
+- Deleting accounts/profiles/users
+- Removing projects/files/documents
+- Deleting posts/comments/entries
+- Clearing data/history/caches
 - Unsubscribing from services
-- Removing any existing data
+- Removing any existing content
+- Canceling subscriptions/services
 
-🛑 MODIFY/UPDATE:
+🛑 MODIFY/UPDATE/EDIT:
 - Changing account settings/preferences
-- Updating profile information
-- Editing existing content
+- Updating profile information/details
+- Editing existing content/documents
 - Changing passwords/security settings
-- Modifying any existing data
+- Modifying permissions/access rights
+- Updating any existing data/configurations
+- Changing system settings
 
-🛑 SUBMIT/SEND:
-- Submitting contact forms
-- Sending messages/emails
-- Placing orders/purchases
-- Submitting reviews/ratings
-- Any form submission with personal data
+🛑 SUBMIT/SEND/SHARE:
+- Submitting contact/feedback forms
+- Sending messages/emails/notifications
+- Sharing content/files/links
+- Publishing/posting content
+- Submitting applications/requests
+- Any form submission with data
 
-🛑 FINANCIAL/TRANSACTIONS:
+🛑 FINANCIAL/PAYMENT/SUBSCRIPTION:
 - Making purchases/payments
-- Adding payment methods
+- Adding payment methods/cards
 - Changing billing information
+- Upgrading/downgrading plans
+- Processing transactions
 - Any money-related actions
+
+🛑 AUTHENTICATION/SECURITY:
+- Changing passwords/credentials
+- Enabling/disabling security features
+- Password reset requests
+- Two-factor authentication changes
+- Security settings modifications
 
 🚫 ABSOLUTELY NO EXCEPTIONS:
 - Even if it seems harmless, ASK FIRST
 - Even if it's "just testing", ASK FIRST  
 - Even if you think the user wants it, ASK FIRST
+- Even if it's for exploration purposes, ASK FIRST
 - Better to ask unnecessarily than act without permission
 
-✅ CONFIRMATION EXAMPLES:
-- "I found a signup form. Should I create an account with email user@example.com? (yes/no)"
-- "There's an 'Add to Cart' button for Product X ($29.99). Should I add it? (yes/no)"
-- "I can submit this contact form with your message. Should I proceed? (yes/no)"
-- "There's a 'Delete Account' option. Do you want me to click it? (yes/no)"
+✅ DETAILED CONFIRMATION EXAMPLES:
+- "I found a 'Create New Canvas' button. Should I click it to create a new project? (yes/no)"
+- "There's a 'Create New Project' button. Should I create a new project for exploration? (yes/no)"
+- "I see an 'Invite Members' button. Should I click it to explore the invitation process? (yes/no)"
+- "There's a contact form. Should I fill it out with test data and submit it? (yes/no)"
+- "I found a 'Delete Project' option. Should I explore what happens when clicked? (yes/no)"
+- "There's an 'Add to Team' button. Should I add a test user to explore this feature? (yes/no)"
 
 🔍 SAFE ACTIONS (NO CONFIRMATION NEEDED):
 - Clicking navigation links (About, Contact, Home, etc.)
-- Opening dropdowns/menus to explore options
-- Scrolling to view content
-- Clicking to view product details (without adding to cart)
-- Browsing/viewing content only
+- Opening dropdowns/menus to view options (without selecting)
+- Switching between tabs/filters to see content
+- Scrolling to view more content
+- Hovering to see tooltips/previews
+- Clicking to view details (without modifying)
+- Browsing/viewing existing content
+- Opening modals/dialogs to see their content (without submitting)
+- Clicking sorting options to see different arrangements
+- Expanding/collapsing sections to view content
 
 🚫 CRITICAL: ACTIONS TO ABSOLUTELY AVOID:
 ⛔ **NEVER CLICK LOGOUT/SIGN OUT BUTTONS**:
@@ -442,32 +720,62 @@ ACTIONS REQUIRING CONFIRMATION (NON-EXHAUSTIVE LIST):
 - Session ending controls
 
 ⚔️ **SMART CONTENT SELECTION STRATEGY**:
-When you see MULTIPLE SIMILAR ITEMS, only interact with ONE example:
+When you see MULTIPLE SIMILAR ITEMS, only interact with ONE example to understand the pattern:
 
-📋 **Project Lists**: Click only one project to explore, not all projects
-🎥 **Video Lists**: Click only one video to test functionality, not every video  
-📝 **Task Lists**: Select only one task to understand the workflow, not all tasks
-📰 **Article Lists**: Click only one article to see the reading experience
-🛍️ **Product Lists**: Explore only one product to understand the interface
-👥 **User Profiles**: Check only one profile to see the profile page structure
-📁 **File Lists**: Open only one file to understand file management
-🏢 **Company Lists**: Select only one company to see company details
-📧 **Message Lists**: Open only one message to see message interface
-🔖 **Category Lists**: Explore only one category to understand navigation
+📋 **Content Lists - Test ONE Example**:
+- **Project Lists**: Click only one project to explore project details page
+- **Video Lists**: Click only one video to test video player functionality  
+- **Task Lists**: Select only one task to understand task management interface
+- **Article Lists**: Click only one article to see reading experience
+- **Product Lists**: Explore only one product to understand product pages
+- **User Profiles**: Check only one profile to see profile page structure
+- **File Lists**: Open only one file to understand file management
+- **Company Lists**: Select only one company to see company details
+- **Message Lists**: Open only one message to see message interface
+- **Category Lists**: Explore only one category to understand navigation
 
-💡 **SELECTION CRITERIA**:
-- Choose the FIRST or most prominent item
-- Pick items that seem most representative  
-- Avoid testing every single similar item
-- Focus on understanding the PATTERN, not exhausting all examples
+🎯 **BUT STILL EXPLORE EVERYTHING ELSE**:
+While being smart about content lists, you MUST still:
+✅ Click ALL different types of buttons (Create, Edit, Delete, etc.)
+✅ Test ALL different types of filters and dropdowns
+✅ Explore ALL different functional areas of the interface
+✅ Interact with ALL unique interface elements
+✅ Test ALL navigation options and menu items
+✅ Open ALL different types of modals/dialogs
+✅ Try ALL search and filtering capabilities
 
-**Examples**:
-✅ "Click on the first project in the project list to explore project details"
-✅ "Select the top video to understand the video player interface"
-✅ "Open the first task to see task management functionality"
-❌ "Click on all projects to see each one"
-❌ "Test every video in the list"
-❌ "Open all tasks to explore them"
+💡 **SMART SELECTION CRITERIA**:
+- Choose the FIRST or most prominent item from lists
+- Pick items that seem most representative of the type
+- Avoid testing every single similar item in a list
+- Focus on understanding the PATTERN and functionality
+- BUT don't skip unique interface elements or functions
+
+🚀 **AGGRESSIVE EXPLORATION EXAMPLES**:
+✅ "Click the 'Create New Canvas' button to explore project creation"
+✅ "Click the 'Invite Members' button to see invitation flow"
+✅ "Click the search filter dropdown to see all filter options"
+✅ "Click the user menu to see account options"
+✅ "Click the settings gear icon to explore configuration options"
+✅ "Click the notification bell to see notification interface"
+✅ "Open the help/support section to see available resources"
+
+❌ **DON'T SKIP IMPORTANT FUNCTIONALITY**:
+- Don't skip "Create" buttons thinking they're too complex
+- Don't skip "Settings" thinking they're not important
+- Don't skip "Admin" sections thinking they're restricted
+- Don't skip "Help" sections thinking they're just documentation
+- Don't skip any functional buttons or controls
+
+🎯 **EXPLORATION PRIORITY ORDER**:
+1. **Navigation elements** (menus, tabs, breadcrumbs)
+2. **Primary action buttons** (Create, Add, New, etc.)
+3. **Content filtering/sorting** (dropdowns, toggles, filters)
+4. **Settings and configuration** (gear icons, preferences)
+5. **User account features** (profile, account settings)
+6. **One example from content lists** (first project, first task, etc.)
+7. **Secondary features** (help, notifications, search)
+8. **Advanced/admin features** (if accessible)
 
 Available tools:
 - page_act: Perform actions on the page (click, type, scroll to a section, scroll to bottom etc.) - provide instruction parameter
@@ -604,11 +912,11 @@ Respond with ONLY valid JSON in this exact format:
 }
 
 IMPORTANT ABOUT isCurrentPageExecutionCompleted:
+DO NOT SET THIS TRUE WHILE GIVING PAGE_ACT COMMANDS.
+WHEN YOU ARE SETTING THIS TO TRUE, CALL STANDBY TOOL WITH 1 SEC WAIT TIME. (COMPULSORY)
 Set this to TRUE when you are confident that:
-- The next action (especially page_act) will navigate to the desired page for your objective
-- You have found the key navigation element (like "Pricing" link for pricing objective)
 - No further actions are needed on the current page
-- The current page processing should stop after this action
+- All tasks are done, then call user_input to ask whether we can conclude this page or not, if user said yes then set isCurrentPageExecutionCompleted to true
 
 ⚠️ CRITICAL: During LOGIN/AUTHENTICATION flows, do NOT set isCurrentPageExecutionCompleted to true:
 - When requesting user credentials (user_input tool)
@@ -842,10 +1150,11 @@ Remember: Break down complex actions into simple steps. One action per step.`;
 
       conversationHistory.push({ role: "user", content: contextPrompt });
 
-      const response = await generateText({
+      // 🆕 USE GENERATEOBJECT FOR ROBUST JSON PARSING
+      const response = await generateObject({
         model: this.model,
         system: systemPrompt,
-        maxTokens: 2000,
+        maxTokens: 60000,
         messages: [
           ...conversationHistory,
           {
@@ -858,43 +1167,10 @@ Remember: Break down complex actions into simple steps. One action per step.`;
             ],
           },
         ],
+        schema: LLMDecisionResponseSchema,
       });
 
-      // console.log("SYSTEM PROMPT", systemPrompt); // Debug log - uncomment if needed
-
-      const textContent = response.text;
-      if (!textContent) {
-        throw new Error("No text content in response");
-      }
-
-      // this.fileManager.saveRawLLMResponse(
-      //   urlHash,
-      //   stepNumber,
-      //   "decision",
-      //   textContent
-      // );
-
-      // Clean the text content before parsing
-      let cleanedContent = textContent.trim();
-
-      // Remove any potential control characters that might break JSON parsing
-      cleanedContent = cleanedContent.replace(/[\x00-\x1F\x7F]/g, "");
-
-      // Try to extract JSON if it's wrapped in markdown code blocks
-      const jsonMatch = cleanedContent.match(
-        /```(?:json)?\s*(\{[\s\S]*\})\s*```/
-      );
-      if (jsonMatch) {
-        cleanedContent = jsonMatch[1];
-      }
-
-      logger.info("🔍 Attempting to parse LLM response", {
-        originalLength: textContent.length,
-        cleanedLength: cleanedContent.length,
-        url,
-      });
-
-      const parsedResponse = JSON.parse(cleanedContent) as LLMDecisionResponse;
+      const parsedResponse = response.object as LLMDecisionResponse;
       this.fileManager.saveLLMResponse(urlHash, stepNumber, "decision", {
         ...parsedResponse,
         image: `data:image/png;base64,${base64Image}`,
@@ -914,122 +1190,6 @@ Remember: Break down complex actions into simple steps. One action per step.`;
         error: error instanceof Error ? error.message : String(error),
         url,
         step: stepNumber,
-      });
-      return null;
-    }
-  }
-
-  /**
-   * Execute page_extract tool
-   */
-  /**
-   * Simplified objective completion checker for page_extract
-   * The main extraction formatting is handled by formatExtractionResults()
-   */
-  async executePageExtract(
-    screenshotBuffer: Buffer,
-    url: string,
-    instruction: string,
-    objective: string,
-    urlHash: string,
-    stepNumber: number,
-    toolExecutionResult: any
-  ): Promise<PageExtractResponse | null> {
-    try {
-      const resizedImage = await this.resizeImageForClaude(screenshotBuffer);
-      const base64Image = resizedImage.toString("base64");
-
-      const systemPrompt = `You are analyzing page extraction results to determine objective completion. Your objective: ${objective}
-
-INSTRUCTION EXECUTED: ${instruction}
-
-TOOL EXECUTION RESULT:
-${JSON.stringify(toolExecutionResult, null, 2)}
-
-🎯 YOUR SOLE PURPOSE: Determine if the objective has been achieved based on the extraction results.
-
-🚨 CRITICAL RESPONSE FORMAT REQUIREMENTS 🚨
-- You MUST respond with ONLY valid JSON
-- NO markdown formatting (no \`\`\`json\`\`\`)
-- NO additional text, explanations, or comments
-- Focus ONLY on objective completion analysis
-- objectiveAchieved is the CRITICAL field - analyze carefully
-
-EXACT JSON FORMAT REQUIRED:
-{
-  "reasoning": "Brief analysis of why this extraction contributes to the objective",
-  "extractedData": {},
-  "relevantFindings": ["Key findings that relate to the objective"],
-  "objectiveProgress": "Assessment of progress toward the objective after this extraction",
-  "objectiveAchieved": false
-}
-
-IMPORTANT ANALYSIS:
-- Compare the extraction results against the stated objective
-- Determine if enough information has been gathered to complete the objective
-- Only set objectiveAchieved to true if the objective is TRULY fulfilled
-- Consider cumulative progress from previous extractions
-- Be conservative - require substantial evidence before marking complete
-
-Focus on objective completion analysis for: ${objective}`;
-
-      const response = await generateText({
-        model: this.model,
-        system: systemPrompt,
-        maxTokens: 2000,
-        messages: [
-          {
-            role: "user",
-            content: [
-              {
-                type: "image",
-                image: `data:image/png;base64,${base64Image}`,
-              },
-              {
-                type: "text",
-                text: `Objective Completion Analysis
-
-URL: ${url}
-Instruction: ${instruction}
-Tool Result: ${JSON.stringify(toolExecutionResult, null, 2)}
-
-TASK: Analyze if this extraction helps achieve the objective and determine if the objective is now complete.
-
-Respond with ONLY valid JSON - no other text or formatting.`,
-              },
-            ],
-          },
-        ],
-      });
-
-      const textContent = response.text;
-      if (!textContent) {
-        throw new Error("No text content in response");
-      }
-
-      // Clean the response to ensure it's pure JSON
-      let cleanedContent = textContent.trim();
-      // Remove any markdown formatting that might have been added
-      cleanedContent = cleanedContent
-        .replace(/```json\n?/g, "")
-        .replace(/```\n?/g, "");
-      // Remove any leading/trailing whitespace or newlines
-      cleanedContent = cleanedContent.trim();
-
-      const parsedResponse = JSON.parse(cleanedContent) as PageExtractResponse;
-      this.fileManager.saveLLMResponse(
-        urlHash,
-        stepNumber,
-        "page_extract_objective_check",
-        parsedResponse
-      );
-
-      return parsedResponse;
-    } catch (error) {
-      logger.error("❌ page_extract objective check failed", {
-        error: error instanceof Error ? error.message : String(error),
-        url,
-        instruction,
       });
       return null;
     }
@@ -1182,386 +1342,6 @@ IMPORTANT:
   }
 
   /**
-   * Format extraction results with comprehensive context
-   */
-  async formatExtractionResults(
-    screenshots: Buffer[], // All screenshots from current page
-    url: string,
-    objective: string,
-    urlHash: string,
-    stepNumber: number,
-    previousExtractions: any[], // All previous raw extraction data from current page
-    previousMarkdowns: string[], // All previous formatted markdown results
-    currentExtractionData: any // Latest extraction data to incorporate
-  ): Promise<string | null> {
-    try {
-      // Create image content for all screenshots
-      const imageContent = await Promise.all(
-        screenshots.map(async (screenshot) => {
-          const resizedImage = await this.resizeImageForClaude(screenshot);
-          const base64Image = resizedImage.toString("base64");
-          return {
-            type: "image" as const,
-            image: `data:image/png;base64,${base64Image}`,
-          };
-        })
-      );
-
-      const systemPrompt = `🔥 You are a TOP-TIER PRODUCT STRATEGY CONSULTANT creating a FINAL COMPREHENSIVE REPORT. Your objective: ${objective}
-
-CURRENT PAGE: ${url}
-
-🚨 CRITICAL MANDATE: PRESERVE ALL PREVIOUS CONTEXT 🚨
-You are creating the FINAL COMPREHENSIVE REPORT that must include ALL previous findings, context, and insights. DO NOT LOSE ANY INFORMATION from previous extractions.
-
-This is NOT a new analysis - this is the FINAL CUMULATIVE REPORT that builds upon and enhances ALL previous work while incorporating new findings.
-
-PREVIOUS EXTRACTION DATA FROM THIS PAGE (MUST PRESERVE ALL):
-${
-  previousExtractions.length > 0
-    ? previousExtractions
-        .map(
-          (data, index) => `
-=== EXTRACTION ${index + 1} ===
-${JSON.stringify(data, null, 2)}
-`
-        )
-        .join("\n")
-    : "None"
-}
-
-PREVIOUS MARKDOWN RESULTS FROM THIS PAGE (MUST INCORPORATE ALL):
-${
-  previousMarkdowns.length > 0
-    ? previousMarkdowns
-        .map(
-          (markdown, index) => `
-=== MARKDOWN VERSION ${index + 1} ===
-${markdown}
-`
-        )
-        .join("\n")
-    : "None"
-}
-
-LATEST EXTRACTION DATA TO INCORPORATE:
-${JSON.stringify(currentExtractionData, null, 2)}
-
-🎯 FINAL REPORT REQUIREMENTS:
-- PRESERVE every insight, detail, and finding from previous extractions
-- ENHANCE and EXPAND upon previous analysis with new data
-- CREATE a comprehensive final report that combines ALL information
-- DO NOT START FRESH - build upon existing work
-- INCLUDE all business insights, technical observations, and strategic analysis from previous versions
-
-🚫 ABSOLUTELY FORBIDDEN CONTENT:
-❌ Basic feature descriptions ("The page has X")
-❌ Surface-level observations ("Users can click Y")
-❌ Short paragraphs under 100 words per section
-❌ Bullet points without strategic analysis
-❌ Obvious statements about visible elements
-❌ Generic descriptions that could apply to any platform
-
-✅ MANDATORY STRATEGIC DEPTH:
-✅ Deep business model analysis with revenue implications
-✅ Competitive positioning with specific market context
-✅ User psychology insights and conversion optimization analysis
-✅ Technical architecture conclusions about platform maturity
-✅ Growth strategy deductions from UX patterns
-✅ Executive-level insights that drive strategic decisions
-
-🎯 REQUIRED ANALYSIS FRAMEWORK:
-
-**MINIMUM CONTENT REQUIREMENTS:**
-- 🏢 Platform Strategy: 400+ words analyzing business model sophistication
-- 💰 Revenue Architecture: 300+ words on monetization complexity
-- 🧠 UX Psychology: 300+ words on conversion and retention design
-- ⚙️ Technical Maturity: 250+ words on architecture and scalability insights
-- 🏆 Market Position: 250+ words on competitive advantages and gaps
-- 📈 Growth Engine: 200+ words on user acquisition and expansion strategies
-- 💡 Strategic Intelligence: 200+ words of actionable executive insights
-
-**ANALYTICAL SOPHISTICATION EXAMPLES:**
-
-Instead of: "The platform uses credits"
-Write: "The credit-based consumption model represents a sophisticated pricing psychology approach designed to maximize lifetime value through variable pricing elasticity. This mechanism enables precise user segmentation based on usage patterns while creating engagement loops that traditional subscription models cannot achieve. The 100-credit beta allocation suggests the platform is in active price discovery, using behavioral data to optimize conversion funnels before full market launch."
-
-Instead of: "There are team features"
-Write: "The multi-tiered collaboration architecture reveals a deliberate enterprise expansion strategy, with permission hierarchies and team management capabilities that indicate targeting of large organization accounts. This collaborative infrastructure represents significant development investment in enterprise-grade features, positioning the platform for high-value account acquisition and reduced churn through organizational lock-in effects."
-
-🎨 EXECUTIVE PRESENTATION FORMATTING:
-
-**VISUAL HIERARCHY:**
-- Strategic section headers with meaningful emojis
-- Data tables showing competitive comparisons  
-- Code blocks for technical architecture insights
-- Blockquotes highlighting key strategic insights
-- Varied formatting to maintain engagement
-
-**ANALYTICAL DEPTH:**
-- Each section minimum 250 words of strategic analysis
-- Specific data points and evidence-based conclusions
-- Industry benchmarking and competitive context
-- Business implications and strategic recommendations
-- Technical sophistication assessment
-
-**PROFESSIONAL STRUCTURE:**
-1. 🎯 **Executive Summary** (200+ words)
-2. 🏢 **Platform Strategy & Positioning** (400+ words)
-3. 💰 **Business Model Architecture** (300+ words)
-4. 🧠 **User Experience Intelligence** (300+ words)
-5. ⚙️ **Technical & Scalability Assessment** (250+ words)
-6. 🏆 **Competitive Intelligence** (250+ words)
-7. 📈 **Growth & Acquisition Strategy** (200+ words)
-8. 💡 **Strategic Recommendations** (200+ words)
-
-🎭 EXECUTIVE MINDSET:
-Think like you're preparing this for:
-- Board of directors strategic review
-- Investor due diligence analysis  
-- Competitive intelligence briefing
-- Product strategy planning session
-- Market expansion assessment
-
-Every sentence must provide strategic value that executives can act upon.
-
-Respond with ONLY the comprehensive strategic analysis in markdown format.`;
-
-      const messages = [
-        {
-          role: "user" as const,
-          content: [
-            ...imageContent,
-            {
-              type: "text" as const,
-              text: `📋 FINAL COMPREHENSIVE PAGE ANALYSIS REPORT
-
-**Target Platform**: ${url}
-**Analysis Objective**: ${objective}
-
-🚨 CRITICAL: This is your FINAL COMPREHENSIVE REPORT that must preserve ALL previous context and findings.
-
-🎯 YOUR MISSION: Create the DEFINITIVE COMPREHENSIVE REPORT for this page that:
-- PRESERVES every insight and detail from ALL previous extractions
-- INCORPORATES all previous analysis and context
-- ENHANCES previous findings with new data
-- CREATES a complete, final report that doesn't lose ANY information
-
-⚠️ DO NOT LOSE PREVIOUS CONTEXT: You have access to all previous extraction data and markdown results. Your job is to create the FINAL version that includes EVERYTHING discovered so far.
-
-This is not a basic summary or new analysis - you must create the ULTIMATE, COMPREHENSIVE FINAL REPORT that includes:
-
-📊 **COMPREHENSIVE COVERAGE REQUIREMENTS:**
-
-**Previous Context Integration** (MANDATORY):
-- Include ALL insights, findings, and analysis from previous extraction versions
-- Enhance and expand upon previous business model analysis
-- Preserve all technical observations and strategic insights
-- Build upon previous competitive intelligence and user experience analysis
-
-**Page Overview & Context** (200+ words):
-- Detailed description of page purpose and role in user journey
-- Strategic positioning within the overall platform architecture
-- Key value propositions and messaging analysis
-- Visual design philosophy and brand positioning
-- ALL previous context and observations about the page
-
-**Detailed Feature Analysis** (300+ words):
-- Comprehensive breakdown of every functional element
-- Strategic purpose and business logic behind each feature
-- User experience flow and interaction design considerations
-- Conversion optimization tactics and psychological triggers
-
-**Business Model Insights** (250+ words):
-- Revenue model indicators and monetization strategies
-- Pricing psychology and user segmentation approaches
-- Enterprise vs consumer market targeting evidence
-- Competitive positioning and differentiation factors
-
-**Technical Implementation Considerations** (200+ words):
-- Architecture and scalability implications
-- Security and enterprise-readiness indicators
-- Integration capabilities and ecosystem approach
-- Development sophistication and technology choices
-
-**User Experience Considerations** (250+ words):
-- Information architecture and navigation strategy
-- User flow optimization and friction reduction
-- Accessibility and usability design decisions
-- Mobile responsiveness and cross-platform considerations
-
-**Strategic Implications & Considerations** (200+ words):
-- Market positioning and competitive advantages
-- Growth strategy and user acquisition tactics
-- Partnership and integration opportunities
-- Future roadmap and expansion considerations
-
-🔍 **REPORTING STANDARDS:**
-- Write with comprehensive detail and thorough analysis
-- Include specific observations and evidence-based conclusions
-- Provide strategic context and business implications
-- Consider multiple perspectives and use cases
-- Explain the reasoning behind design and feature decisions
-
-📝 **FINAL REPORT FORMAT:**
-Create the DEFINITIVE, detailed professional report that:
-- Combines ALL previous findings into one comprehensive document
-- Builds upon every previous insight and analysis
-- Creates the most complete version possible
-- Preserves the full context and history of discoveries
-
-**TONE**: Professional, analytical, comprehensive, and detailed - like the FINAL thorough business analyst report.
-
-**CRITICAL REMINDER**: This is the FINAL VERSION that must include EVERYTHING discovered about this page across all previous extractions. Do not lose ANY previous context or insights.
-
-Provide the ULTIMATE COMPREHENSIVE FINAL REPORT that preserves all previous context while incorporating new findings.`,
-            },
-          ],
-        },
-      ];
-
-      const response = await generateText({
-        model: this.model,
-        system: systemPrompt,
-        maxTokens: 8000,
-        messages: messages,
-      });
-
-      const textContent = response.text;
-      if (!textContent) {
-        throw new Error("No text content in response");
-      }
-
-      // Save the formatted response
-      this.fileManager.saveLLMResponse(
-        urlHash,
-        stepNumber,
-        "format_extraction",
-        { formattedMarkdown: textContent.trim() }
-      );
-
-      return textContent.trim();
-    } catch (error) {
-      logger.error("❌ formatExtractionResults failed", {
-        error: error instanceof Error ? error.message : String(error),
-        url,
-        previousExtractionsCount: previousExtractions.length,
-        previousMarkdownsCount: previousMarkdowns.length,
-      });
-      return null;
-    }
-  }
-
-  /**
-   * Ask Gemini if the interaction graph needs to be updated after a page_act
-   */
-  async shouldUpdateGraph(
-    globalStore: PageStore,
-    currentGraph: InteractionGraph | undefined,
-    latestAction: string,
-    latestScreenshot: string
-  ): Promise<boolean> {
-    try {
-      // Define Zod schema for graph update decision
-      const GraphUpdateDecisionSchema = z.object({
-        needsUpdate: z
-          .boolean()
-          .describe("Whether the interaction graph needs to be updated"),
-        reasoning: z
-          .string()
-          .describe(
-            "Brief explanation of why the graph does/doesn't need updating"
-          ),
-      });
-
-      const systemPrompt = `You are analyzing whether an interaction graph needs to be updated after a page action.
-
-CURRENT ACTION: ${latestAction}
-
-GLOBAL STORE DATA:
-- URL: ${globalStore.url}
-- Initial Screenshot: Available
-- Action History: ${globalStore.actionHistory.length} previous actions
-- Previous Actions: ${globalStore.actionHistory.map((a) => a.instruction).join(", ")}
-
-CURRENT GRAPH STATUS:
-${currentGraph ? `Existing graph with ${currentGraph.nodes.length} nodes and ${currentGraph.edges.length} edges` : "No existing graph"}
-
-ANALYSIS CRITERIA:
-- Did the action reveal new interactive elements (buttons, dropdowns, modals, dialogs)?
-- Did the action change the page state significantly (new sections appeared, elements changed)?
-- Did the action create new interaction flows or pathways?
-- Are there new relationships between UI elements that should be mapped?
-
-Analyze the screenshot and determine if the graph needs updating.`;
-
-      // Build interleaved conversation history for graph update decision
-      const interleavedMessages = this.buildInterleavedConversationHistory(
-        globalStore,
-        latestScreenshot
-      );
-
-      // Add decision instruction message
-      interleavedMessages.push({
-        role: "user",
-        content: [
-          {
-            type: "text",
-            text: `Analyze if the graph needs updating after this action: "${latestAction}"`,
-          },
-        ],
-      });
-
-      logger.info(`📸 Gemini graph update decision using interleaved history`, {
-        totalActions: globalStore.actionHistory.length,
-        totalMessages: interleavedMessages.length,
-        latestAction,
-      });
-
-      const response = await generateObject({
-        model: this.model,
-        schema: GraphUpdateDecisionSchema,
-        system: systemPrompt,
-        maxTokens: 1000,
-        messages: interleavedMessages,
-      });
-
-      logger.info("🤖 Gemini graph update decision", {
-        needsUpdate: response.object.needsUpdate,
-        reasoning: response.object.reasoning,
-        action: latestAction,
-      });
-
-      return response.object.needsUpdate;
-    } catch (error) {
-      logger.error("❌ Failed to get graph update decision from Gemini", {
-        error,
-      });
-      return false; // Default to not updating if decision fails
-    }
-  }
-
-  /**
-   * Generate page navigation graph when URL changes (no Gemini confirmation needed)
-   */
-  async generatePageNavigationGraph(
-    sourcePageStore: PageStore,
-    currentGraph: InteractionGraph | undefined,
-    navigationAction: string,
-    sourceUrl: string,
-    targetUrl: string
-  ): Promise<InteractionGraph | null> {
-    // Use the new comprehensive page change navigation method
-    return this.generatePageChangeNavigationGraph(
-      sourcePageStore,
-      currentGraph,
-      navigationAction,
-      sourceUrl,
-      targetUrl
-    );
-  }
-
-  /**
    * Generate image-based flow interaction graph using Claude
    */
   async generateInteractionGraph(
@@ -1569,312 +1349,455 @@ Analyze the screenshot and determine if the graph needs updating.`;
     currentGraph: InteractionGraph | undefined
   ): Promise<InteractionGraph | null> {
     try {
-      const systemPrompt = `You are an expert UI/UX analyst creating comprehensive image-based flow diagrams for web applications.
+      const systemPrompt = `You are a flow expert creating picture stories of website interactions. Each picture shows what the user sees on their screen.
+
+🚨 CRITICAL OUTPUT FORMAT REQUIREMENT:
+You MUST respond with ONLY a valid JSON object. NO extra words, NO explanations, NO markdown formatting, NO backticks, NO comments outside the JSON.
+
+Your response must be EXACTLY this format:
+{
+  "nodes": [...],
+  "edges": [...], 
+  "flows": [...],
+  "description": "...",
+  "pageSummary": "...",
+  "lastUpdated": "2024-01-01T12:00:00.000Z"
+}
+
+📋 DETAILED JSON STRUCTURE REQUIREMENTS:
+
+NODES ARRAY - Each node represents a visual state/screenshot.
+🚨 EVERY FIELD MARKED AS REQUIRED MUST BE PRESENT. NO EXCEPTIONS!
+
+{
+  "id": "step_0_initial", // ⚠️ REQUIRED: Unique identifier for the image
+  "stepNumber": 0, // ⚠️ REQUIRED: Step number from action history (must be number, not string)
+  "instruction": "Initial page load", // ⚠️ REQUIRED: What action led to this state (must be string)
+  "imageName": "step_0_initial", // ⚠️ REQUIRED: Image filename/identifier (must match id exactly)
+  "imageData": "PLACEHOLDER_WILL_BE_REPLACED", // ⚠️ REQUIRED: Use this exact string, will be replaced automatically
+  "metadata": { // ⚠️ REQUIRED: Complete metadata object - ALL sub-fields required
+    "visibleElements": ["Login form", "Email input"], // ⚠️ REQUIRED: Array of UI elements visible (can be empty array [])
+    "clickableElements": ["Submit button", "Link"], // ⚠️ REQUIRED: Array of interactive elements (can be empty array [])
+    "flowsConnected": ["user_authentication_process"], // ⚠️ REQUIRED: Array of flow IDs this node belongs to (can be empty array [])
+    "dialogsOpen": [], // ⚠️ REQUIRED: Array of open dialogs/modals (can be empty array [])
+    "timestamp": "2024-01-01T12:00:00.000Z", // ⚠️ REQUIRED: ISO timestamp with milliseconds
+    "pageTitle": "Login Page" // ⚠️ REQUIRED: Page title or description (must be string)
+  }
+}
+
+🚨 FORBIDDEN FIELDS IN NODES: Do NOT include these fields (they will cause validation errors):
+- "imageUrl" (not in schema)
+- "position" (unless you want to specify x,y coordinates)
+- Any other fields not listed above
+
+EDGES ARRAY - Each edge represents a transition between visual states.
+🚨 EVERY FIELD MARKED AS REQUIRED MUST BE PRESENT. NO EXCEPTIONS!
+
+{
+  "from": "step_0_initial", // ⚠️ REQUIRED: Source node ID (must match a node's id)
+  "to": "step_1_after_click", // ⚠️ REQUIRED: Target node ID (must match a node's id)
+  "action": "click_login_button", // ⚠️ REQUIRED: Action that caused transition (must be string)
+  "description": "User clicks login button to submit credentials", // ⚠️ REQUIRED: Human readable description (must be string)
+  "instruction": "Click the login button" // ⚠️ REQUIRED: Original instruction text (must be string)
+}
+
+FLOWS ARRAY - Each flow represents a complete user journey.
+🚨 EVERY FIELD MARKED AS REQUIRED MUST BE PRESENT. USE EXACT FIELD NAMES!
+
+{
+  "id": "user_authentication_process", // ⚠️ REQUIRED: Unique flow identifier (snake_case)
+  "name": "User Authentication Process", // ⚠️ REQUIRED: Human readable flow name (must be string)
+  "description": "Complete login workflow from landing page to dashboard", // ⚠️ REQUIRED: Flow description (must be string)
+  "flowType": "linear", // ⚠️ REQUIRED: Must be exactly "linear", "branching", or "circular"
+  "imageNodes": ["step_0_initial", "step_1_credentials", "step_2_dashboard"], // ⚠️ REQUIRED: Array of node IDs in flow
+  "startImageName": "step_0_initial", // ⚠️ REQUIRED: First node in flow (DO NOT use "startNode")
+  "endImageNames": ["step_2_dashboard"] // ⚠️ REQUIRED: Array of possible end nodes (DO NOT use "endNode")
+}
+
+🚨 FORBIDDEN FIELDS IN FLOWS: Do NOT include these fields (they will cause validation errors):
+- "startNode" (use "startImageName" instead)
+- "endNode" (use "endImageNames" array instead)
+- Any other fields not listed above
+
+ROOT LEVEL FIELDS:
+🚨 EVERY ROOT FIELD MARKED AS REQUIRED MUST BE PRESENT. NO EXCEPTIONS!
+
+- "description": "Complete interaction graph showing user authentication and navigation flows" // ⚠️ REQUIRED: Overall graph description (must be string)
+- "pageSummary": "Login page with email/password form and navigation options" // ⚠️ REQUIRED: Summary of the page content (must be string)  
+- "lastUpdated": "2024-01-01T12:00:00.000Z" // ⚠️ REQUIRED: ISO timestamp when graph was generated (must be valid ISO format)
+
+🚨 CRITICAL FIELD REQUIREMENTS - FOLLOW EXACTLY OR VALIDATION WILL FAIL:
+- ALL fields marked with ⚠️ REQUIRED must be present - NO MISSING FIELDS ALLOWED
+- Arrays can be empty [] but MUST exist (do not omit arrays)
+- Strings cannot be null or undefined - use empty string "" if no value
+- stepNumber must be a NUMBER (0, 1, 2, etc.) - NOT a string
+- timestamps must be valid ISO format with milliseconds (.000Z)
+- flowType must be EXACTLY "linear", "branching", or "circular" - no other values
+- Use "startImageName" and "endImageNames" in flows - NOT "startNode" or "endNode"
+- Use "imageData" in nodes - NOT "imageUrl"
+- IDs must be consistent across nodes, edges, and flows
+
+ABSOLUTELY FORBIDDEN:
+- Any text before the JSON object
+- Any text after the JSON object  
+- Markdown code blocks with backticks
+- Comments or explanations outside JSON
+- Multiple JSON objects
+- Malformed JSON syntax
+- Missing required fields
+- Null or undefined values
+
+📝 COMPLETE EXAMPLE OF VALID JSON OUTPUT (COPY THIS EXACT FORMAT):
+{
+  "nodes": [
+    {
+      "id": "step_0_initial",
+      "stepNumber": 0,
+      "instruction": "Initial page load",
+      "imageName": "step_0_initial",
+      "imageData": "PLACEHOLDER_WILL_BE_REPLACED",
+      "metadata": {
+        "visibleElements": ["Homepage header", "Navigation menu", "Login button"],
+        "clickableElements": ["Login button", "Sign up link", "Menu items"],
+        "flowsConnected": ["site_navigation_flow"],
+        "dialogsOpen": [],
+        "timestamp": "2024-01-01T10:00:00.000Z",
+        "pageTitle": "Homepage"
+      }
+    },
+    {
+      "id": "step_1_login_page",
+      "stepNumber": 1,
+      "instruction": "Click login button",
+      "imageName": "step_1_login_page",
+      "imageData": "PLACEHOLDER_WILL_BE_REPLACED",
+      "metadata": {
+        "visibleElements": ["Login form", "Email field", "Password field", "Submit button"],
+        "clickableElements": ["Email field", "Password field", "Submit button", "Back link"],
+        "flowsConnected": ["user_authentication_flow"],
+        "dialogsOpen": [],
+        "timestamp": "2024-01-01T10:01:00.000Z",
+        "pageTitle": "Login Page"
+      }
+    }
+  ],
+  "edges": [
+    {
+      "from": "step_0_initial",
+      "to": "step_1_login_page",
+      "action": "click_login_button",
+      "description": "User clicks login button to navigate to authentication page",
+      "instruction": "Click the login button"
+    }
+  ],
+  "flows": [
+    {
+      "id": "user_authentication_flow",
+      "name": "User Authentication Process",
+      "description": "Complete login workflow from homepage to login page",
+      "flowType": "linear",
+      "imageNodes": ["step_0_initial", "step_1_login_page"],
+      "startImageName": "step_0_initial",
+      "endImageNames": ["step_1_login_page"]
+    }
+  ],
+  "description": "Interaction graph showing navigation from homepage to login page",
+  "pageSummary": "Website homepage with navigation options and login functionality",
+  "lastUpdated": "2024-01-01T10:01:00.000Z"
+}
+
+🚨 FINAL VALIDATION CHECKLIST - VERIFY BEFORE SENDING:
+✅ Every node has: id, stepNumber, instruction, imageName, imageData, metadata
+✅ Every node metadata has: visibleElements, clickableElements, flowsConnected, dialogsOpen, timestamp, pageTitle  
+✅ Every edge has: from, to, action, description, instruction
+✅ Every flow has: id, name, description, flowType, imageNodes, startImageName, endImageNames
+✅ Root level has: nodes, edges, flows, description, pageSummary, lastUpdated
+✅ No forbidden fields: imageUrl, startNode, endNode, position (unless intended)
+✅ stepNumber is NUMBER not string
+✅ timestamps have .000Z format
+✅ Arrays exist (can be empty [])
+✅ flowType is exactly "linear", "branching", or "circular"
+
+🚨 REQUIRED: Start your response with { and end with }. Nothing else.
 
 ${this.flowNamingGuidelines}
 ${this.edgeNamingGuidelines}
 
-🚨 CRITICAL DATA PRESERVATION WARNING:
-Your response will COMPLETELY REPLACE the existing graph. You are STRICTLY FORBIDDEN from losing ANY existing data.
-You MUST include EVERY SINGLE existing node, edge, and flow EXACTLY as they are, plus any new discoveries.
+SUPER IMPORTANT RULE: 
+Keep ALL existing pictures and stories EXACTLY the same. Only ADD new pictures and stories. NEVER delete or change existing ones!
 
-⚠️ ABSOLUTE PRESERVATION REQUIREMENTS:
-- **NEVER MODIFY** existing flows - keep them exactly as they are
-- **NEVER REMOVE** existing nodes or edges - preserve all previous states
-- **NEVER CHANGE** existing flow names, descriptions, or structures
-- **ONLY ADD** new discoveries to existing flows or create new flows
-- **MAINTAIN COMPLETE HISTORY** from the very first step to the current state
-- **PRESERVE ALL TIMESTAMPS** and metadata exactly as they were
-- **KEEP ALL VISUAL STATES** in chronological order without gaps
+WHAT IS A FLOW? (Like a Story Chapter)
 
-🔍 COMPLETE ANALYSIS REQUIREMENT:
-You MUST analyze the ENTIRE chat history, ALL screenshots, and EVERY action to create a COMPLETE graph:
-- **EVERY IMAGE MUST BE INCLUDED** in at least one flow - this is COMPULSORY
-- **NO IMAGE CAN BE LEFT OUT** - if an image exists, it must be part of a flow
-- **ANALYZE ALL SCREENSHOTS** from the conversation history
-- **CHECK ALL ACTIONS** performed during exploration
-- **IDENTIFY MISSING IMAGES** that aren't in existing flows
-- **ADD MISSING IMAGES** to appropriate flows or create new flows
-- **COMPLETE EDGE LABELS** for all transitions between images
-- **FULL FLOW COVERAGE** from the very beginning to the very end
+A FLOW is a complete story of how someone accomplishes ONE goal on the website:
+- "Making Pancakes Flow": kitchen -> get_ingredients -> mix_batter -> cook_pancakes -> eat_pancakes
+- "Login to Website Flow": login_page -> enter_password -> click_login -> dashboard_page
+- "Upload Photo Flow": gallery_page -> click_upload -> choose_file -> photo_uploaded
 
-🔥 WHAT ARE FLOWS? WHY ARE WE CREATING THEM?
-FLOWS represent complete user journeys through the application:
-- **PURPOSE**: Track how users navigate through different states to accomplish goals
-- **VALUE**: Essential for UX analysis, testing, and understanding user experience
-- **COMPOSITION**: Each flow is a sequence of connected image states showing a complete journey
+Each flow tells ONE complete story from start to finish!
 
-FLOW EXAMPLES:
-- "User Authentication Process": login_page → enter_credentials → validate → dashboard
-- "File Upload Workflow": main_page → click_upload → file_dialog → select_file → preview → upload_complete
-- "E-commerce Checkout Process": product_page → add_to_cart → cart_view → checkout_form → payment → confirmation
-- "Navigation Discovery Journey": home_page → menu_expand → section_select → content_view
-- "Settings Configuration Flow": dashboard → settings_menu → configuration_panel → save_changes
+THE GOLDEN RULE: INDEPENDENCE vs DEPENDENCY
 
-🚨 CRITICAL FLOW STEP INCLUSION REQUIREMENT:
-⚠️ **NEVER SKIP STEPS IN A FLOW - INCLUDE ALL AVAILABLE IMAGES**:
-- If a flow has multiple step images available, you MUST include EVERY SINGLE ONE
-- Do NOT skip intermediate steps or combine multiple steps into one
-- Each step image represents a distinct state that must be preserved
-- Missing steps break the flow continuity and lose valuable UX data
+This is the MOST IMPORTANT concept - like asking "Can I do this WITHOUT doing that first?"
 
-**Example - File Upload Flow**:
-❌ WRONG: step_0_initial → step_5_upload_complete (missing steps 1,2,3,4)
-✅ CORRECT: step_0_initial → step_1_click_upload → step_2_file_dialog → step_3_file_selected → step_4_preview → step_5_upload_complete
+INDEPENDENT ACTIONS = BRANCHING FLOWS
+Question: "Can I click this button WITHOUT needing to do the previous step first?"
+Answer: "YES" -> Create SEPARATE flows that branch from the same starting point
 
-**Flow Completeness Rules**:
-1. Include EVERY image that belongs to the flow sequence
-2. Maintain chronological order of step numbers
-3. Connect ALL intermediate steps with appropriate edges
-4. Each step must show progression toward the flow goal
-5. No gaps allowed in step sequences
+Example - Project Filtering (BRANCHING):
+Homepage with filters: [All Projects] [Created by me] [Shared with me]
 
-🎯 IMAGE STATE ANALYSIS OVERVIEW:
-You are analyzing screenshots captured during web exploration. Each image represents a different APPLICATION STATE after specific user actions.
+Step 1: Click "All Projects" button
+Step 5: Click "Created by me" button  
+Step 8: Click "Shared with me" button
 
-🔧 YOUR CORE RESPONSIBILITIES:
-1. **VISUAL DEDUPLICATION**: Identify visually identical states and merge into single nodes
-2. **FLOW MAPPING**: Group related image sequences into logical user journeys  
-3. **PATTERN DETECTION**: Identify linear, branching, and circular flow patterns
-4. **TRANSITION ANALYSIS**: Create edges ONLY when visual changes actually occur
+ANALYSIS:
+- Can I click "Created by me" WITHOUT clicking "All Projects" first? YES!
+- Can I click "Shared with me" WITHOUT doing step 1 or 5? YES!
+- All three are INDEPENDENT actions from the same homepage
 
-⚠️ CRITICAL EDGE CREATION RULES - VISUAL CHANGE DETECTION:
-🔍 ONLY CREATE EDGES WHEN THERE ARE ACTUAL VISUAL CHANGES:
-- Compare the "before" image state with the "after action" image state
-- IF the images are visually identical → DO NOT create an edge
-- IF the images show different content/UI → CREATE an edge
+CORRECT FLOW STRUCTURE:
+Flow: "Project Filtering Options"
+Homepage -> [All Projects View]
+Homepage -> [Created by Me View]  
+Homepage -> [Shared with Me View]
 
-❌ DO NOT CREATE EDGES FOR:
-- Button clicks that don't change the page visually (no response)
-- Hover actions that don't trigger visual changes
-- Clicks on inactive/disabled elements
-- Actions that fail silently without UI feedback
-- Form submissions that don't show success/error states
-- Loading states that look identical to the previous state
+This is BRANCHING because all options are available independently!
 
-✅ CREATE EDGES ONLY FOR:
-- Page navigation (different page content)
-- Modal/dialog opening or closing
-- Form field changes (text appears in inputs)
-- Content updates (new text/images appear)
-- UI state changes (menus expand, tabs switch)
-- Error messages appearing
-- Success notifications showing
-- Loading → content loaded transitions
+DEPENDENT ACTIONS = LINEAR FLOWS
+Question: "Can I do this WITHOUT doing the previous step first?"
+Answer: "NO" -> Connect them in a LINEAR sequence
 
-🔍 VISUAL COMPARISON EXAMPLES:
-Example 1: Click "Upload" button
-- Before: Page with upload button
-- After: SAME page with upload button (no change)
-- → NO EDGE (action had no visual effect)
+Example - File Upload (LINEAR):
+Step 1: Main page
+Step 2: Click "Upload" button -> File dialog opens
+Step 3: Select file -> Preview appears
+Step 4: Click "Confirm" -> Upload completes
 
-Example 2: Click "Upload" button
-- Before: Page with upload button  
-- After: File selection dialog opened
-- → CREATE EDGE (visual change occurred)
+ANALYSIS:
+- Can I see file dialog WITHOUT clicking Upload first? NO!
+- Can I see preview WITHOUT selecting file first? NO! 
+- Can I confirm upload WITHOUT seeing preview first? NO!
+- Each step DEPENDS on the previous one
 
-Example 3: Type in input field
-- Before: Empty input field
-- After: Input field with text visible
-- → CREATE EDGE (visual change occurred)
+CORRECT FLOW STRUCTURE:
+Flow: "File Upload Process"
+[Main Page] -> [Upload Dialog] -> [File Preview] -> [Upload Complete]
+
+This is LINEAR because each step requires the previous one!
+
+CIRCULAR FLOWS
+Sometimes you return to where you started:
+Example - Settings and Return:
+[Dashboard] -> [Settings] -> [Save Changes] -> [Dashboard]
+
+CRITICAL BRANCHING vs LINEAR EXAMPLES
+
+Example 1: Navigation Menu (BRANCHING)
+Homepage has menu: [Projects] [Teams] [Settings] [Profile]
+
+Step 2: Click "Projects" 
+Step 7: Click "Teams"
+Step 12: Click "Settings"
+
+WRONG (Linear): Projects -> Teams -> Settings
+RIGHT (Branching): 
+Homepage -> [Projects Page]
+Homepage -> [Teams Page]  
+Homepage -> [Settings Page]
+
+WHY? Because I can click ANY menu item directly from homepage!
+
+Example 2: Login Process (LINEAR)
+Step 1: Login page (empty form)
+Step 2: Enter username -> form shows username
+Step 3: Enter password -> form shows username + password  
+Step 4: Click login -> Dashboard appears
+
+ANALYSIS: Each step builds on the previous one
+CORRECT: [Empty Form] -> [Username Entered] -> [Password Entered] -> [Dashboard]
+
+Example 3: Shopping Filters (BRANCHING)
+Product page has filters: [Price: Low-High] [Price: High-Low] [Rating] [Date]
+
+Step 3: Click "Price: Low-High"
+Step 8: Click "Rating" 
+Step 15: Click "Date"
+
+WRONG (Linear): Price filter -> Rating filter -> Date filter
+RIGHT (Branching):
+Product Page -> [Price Low-High Results]
+Product Page -> [Rating Sorted Results]  
+Product Page -> [Date Sorted Results]
+
+WHY? I can apply ANY filter directly without applying others first!
+
+Example 4: Multi-Step Form (LINEAR)
+Step 1: Personal Info page
+Step 2: Fill name -> form updates
+Step 3: Click "Next" -> Address page appears
+Step 4: Fill address -> form updates  
+Step 5: Click "Next" -> Payment page appears
+
+ANALYSIS: Must complete each step to proceed
+CORRECT: [Personal Info] -> [Address Info] -> [Payment Info]
+
+HOW TO ANALYZE INDEPENDENCE
+
+For EVERY action, ask these simple questions:
+
+1. "What page am I starting from?"
+2. "Can I do this action directly from that page?"  
+3. "Or do I need to do something else first?"
+
+If you can do it directly -> BRANCH from the starting page
+If you need to do something first -> LINEAR from the prerequisite
+
+Example Analysis:
+Starting page: Dashboard with buttons [Create Project] [View Projects] [Settings]
+
+Action 1: Click "Create Project" 
+Q: Can I click this directly from dashboard? YES -> Branch from dashboard
+
+Action 2: Click "View Projects"
+Q: Can I click this directly from dashboard? YES -> Branch from dashboard  
+
+Action 3: In project list, click "Edit Project"
+Q: Can I do this directly from dashboard? NO! I need to view projects first
+-> Linear from "View Projects" page
+
+RESULT:
+Flow 1: "Project Creation" - Dashboard -> Create Project Page
+Flow 2: "Project Management" - Dashboard -> View Projects -> Edit Project
+
+STEP NUMBERS ARE JUST REFERENCE NUMBERS!
+
+Think of step numbers like page numbers in a book:
+- Page 5 might show a picture of a cat
+- Page 50 might ALSO show a picture of the SAME cat  
+- You don't connect them just because one is page 5 and other is page 50!
+- You connect them because they show the SAME thing or related story!
+
+Step Number Example:
+step_3: Homepage with navigation menu
+step_15: User returns to same homepage (after exploring other pages)
+step_27: User returns to same homepage again
+
+WRONG: Create linear flow step_3 -> step_15 -> step_27
+RIGHT: These are the SAME visual state! Merge into ONE node called "Homepage"
+
+VISUAL CHANGE DETECTION (When to Connect Pictures)
+
+Only connect two pictures if something ACTUALLY changed:
+
+CONNECT THESE (Visual change occurred):
+- Button click -> New page loads
+- Form submission -> Success message appears  
+- Menu click -> Dropdown opens
+- Tab click -> Different content shows
+
+DON'T CONNECT THESE (No visual change):
+- Button click -> Nothing happens (broken button)
+- Form click -> Same form (no response)
+- Hover action -> No visual feedback
+
+SIMPLE RULES FOR CREATING FLOWS
+
+1. Start with visual content, NOT step numbers
+2. Ask "Is this independent or dependent?"
+3. Group related actions into complete stories
+4. Connect only when something visually changes
+5. Every picture must be in at least one story
+
+FINAL EXAMPLE - Complete Analysis
+
+Let's say we have these screenshots:
+step_0: Homepage with [Products] [About] [Contact] buttons
+step_2: Products page (clicked Products button)  
+step_5: About page (clicked About button)
+step_8: Contact page (clicked Contact button)
+step_10: Product details (clicked on specific product)
+step_12: Shopping cart (clicked Add to Cart)
+
+ANALYSIS:
+- Products, About, Contact are INDEPENDENT (can click any directly from homepage)
+- Product details DEPENDS on being in Products page first
+- Shopping cart DEPENDS on viewing product details first
+
+CORRECT FLOWS:
+Flow 1: "Site Navigation" (Branching)
+Homepage -> [Products Page]
+Homepage -> [About Page]
+Homepage -> [Contact Page]
+
+Flow 2: "Product Purchase" (Linear)  
+[Products Page] -> [Product Details] -> [Shopping Cart]
+
+QUEUING SYSTEM UNDERSTANDING
+The system sometimes "queues" pages and returns to previous ones:
+- step_3: Homepage
+- step_4: Click "About" -> About page  
+- step_5: System returns to Homepage (About queued)
+- step_6: Click "Contact" -> Contact page
+- step_7: System returns to Homepage (Contact queued)
+
+step_3, step_5, step_7 are ALL the same Homepage -> Merge into ONE node!
+
+Remember: Think like you're telling a story to a 5-year-old. Each flow should make sense as a complete story!
+
+COMPLETE ANALYSIS REQUIREMENTS:
+- EVERY IMAGE must be included in at least one flow
+- ANALYZE ALL SCREENSHOTS from conversation history  
+- VISUAL DEDUPLICATION: Merge identical screenshots
+- PRESERVE ALL EXISTING DATA - never delete anything
+- CREATE COMPLETE STORIES from start to finish
 
 PAGE DATA ANALYSIS:
 - URL: ${globalStore.url}  
 - Total Actions Performed: ${globalStore.actionHistory.length}
 - Initial Screenshot: Available as baseline state
 
-📝 ACTION SEQUENCE TO ANALYZE:
+ACTION SEQUENCE TO ANALYZE:
 ${globalStore.actionHistory
   .map(
     (action, index) => `
 ${index + 1}. Action: "${action.instruction}" 
-   → Results in State: ${action.imageName}
+   -> Results in State: ${action.imageName}
    Step: ${action.stepNumber} | Time: ${action.timestamp}
 `
   )
   .join("")}
 
-🔍 COMPLETE IMAGE INVENTORY CHECK:
+COMPLETE IMAGE INVENTORY CHECK:
 You MUST ensure EVERY image is included in a flow:
 
 AVAILABLE IMAGES:
-1. **Initial State**: step_0_initial (${globalStore.initialScreenshot ? "Available" : "Missing"})
+1. Initial State: step_0_initial (${globalStore.initialScreenshot ? "Available" : "Missing"})
 ${globalStore.actionHistory
   .map(
     (action, index) =>
-      `${index + 2}. **After Action ${action.stepNumber}**: ${action.imageName} (${action.after_act ? "Available" : "Missing"})`
+      `${index + 2}. After Action ${action.stepNumber}: ${action.imageName} (${action.after_act ? "Available" : "Missing"})`
   )
   .join("\n")}
-
-🚨 MANDATORY FLOW INCLUSION RULES:
-- **EVERY SINGLE IMAGE ABOVE MUST BE INCLUDED** in at least one flow
-- **NO IMAGE CAN BE EXCLUDED** - if it exists in the data, it must be in a flow
-- **CHECK EACH IMAGE** against existing flows to ensure coverage
-- **ADD MISSING IMAGES** to appropriate flows or create new flows
-- **COMPLETE THE JOURNEY** from first image to last image
 
 ${
   currentGraph
     ? `
-🔒 EXISTING GRAPH DATA TO PRESERVE COMPLETELY:
+EXISTING GRAPH DATA TO PRESERVE COMPLETELY:
 YOU ARE ABSOLUTELY FORBIDDEN FROM LOSING ANY OF THIS DATA.
-EVERY SINGLE ITEM BELOW MUST BE INCLUDED IN YOUR RESPONSE.
-
-🚨 STRICT PRESERVATION RULES:
-- **COPY EVERYTHING EXACTLY** - do not modify, remove, or change anything
-- **MAINTAIN COMPLETE TIMELINE** from step 0 to current step
-- **PRESERVE ALL FLOW STRUCTURES** exactly as they are
-- **KEEP ALL NODE CONNECTIONS** and relationships intact
-- **NEVER REORGANIZE** existing flows or change their names
-- **ONLY ADD NEW CONTENT** to existing flows or create new flows
-
-CURRENT STATISTICS:
-- Image Nodes: ${currentGraph.nodes.length} (PRESERVE ALL)
-- Edges: ${currentGraph.edges.length} (PRESERVE ALL)  
-- Flows: ${currentGraph.flows?.length || 0} (PRESERVE ALL)
-- Description: ${currentGraph.description}
-- Page Summary: ${currentGraph.pageSummary}
 
 EXISTING IMAGE NODES (PRESERVE EVERY SINGLE ONE):
 ${currentGraph.nodes.map((node) => `- ${node.id}: Step ${node.stepNumber} | Action: "${node.instruction}" | Flows: [${node.metadata.flowsConnected.join(", ")}]`).join("\n")}
 
 EXISTING EDGES (PRESERVE EVERY SINGLE ONE):
-${currentGraph.edges.map((edge) => `- ${edge.from} → ${edge.to}: ${edge.action} | ${edge.description}`).join("\n")}
+${currentGraph.edges.map((edge) => `- ${edge.from} -> ${edge.to}: ${edge.action} | ${edge.description}`).join("\n")}
 
 EXISTING FLOWS (PRESERVE EVERY SINGLE ONE):
 ${currentGraph.flows?.map((flow) => `- ${flow.id}: ${flow.name} (${flow.flowType}) | Images: [${flow.imageNodes.join(", ")}]`).join("\n") || "No existing flows"}
 
-🚨 CRITICAL: Your response replaces everything. Include ALL existing items above PLUS any new discoveries.
-**NEVER REMOVE OR MODIFY** any of the above data - only add new content.
-
-🔍 COMPLETE GRAPH VERIFICATION:
-Before finalizing your response, verify that:
-1. **EVERY IMAGE** from the inventory is included in at least one flow
-2. **ALL EDGES** have complete labels describing the transitions
-3. **ALL FLOWS** cover the complete journey from start to end
-4. **NO IMAGES** are left out or missing from flows
-5. **COMPLETE TIMELINE** is maintained from step 0 to final step
-
-🎯 YOUR GOAL: Create a COMPLETE graph that shows the ENTIRE user journey with EVERY image included in appropriate flows.
+CRITICAL: Include ALL existing items above PLUS any new discoveries.
 `
     : "No existing graph - create from scratch by analyzing the image sequence."
-}
-
-🏗️ STANDARDIZED NAMING REQUIREMENTS:
-
-INITIAL IMAGE NAMING:
-- The very first image (page load) MUST ALWAYS be named: "step_0_initial"
-- This provides consistent identification across all graphs
-
-FLOW NAMING RULES:
-✅ GOOD FLOW NAMES (use these patterns):
-- "User Authentication Process" (not "login_flow")
-- "File Upload Workflow" (not "upload_flow")  
-- "Product Search Journey" (not "search_flow")
-- "Account Registration Process" (not "signup_flow")
-- "Settings Configuration Flow" (not "settings_flow")
-- "Payment Checkout Process" (not "payment_flow")
-- "Content Creation Workflow" (not "content_flow")
-- "Navigation Discovery Journey" (not "navigation_flow")
-- "Form Validation Process" (not "form_flow")
-- "Modal Interaction Sequence" (not "dialog_flow")
-
-🎯 **FUTURE-FOCUSED FLOW NAMING STRATEGY**:
-Create flow names that answer: "If someone wanted to accomplish this task in the future, what would they search for?"
-
-**Naming Framework**: [Action/Goal] + [Process Type] + [Context]
-
-**Examples of Excellent Flow Names**:
-✅ "Complete User Onboarding Experience" - Shows the entire new user journey
-✅ "Project Creation and Setup Workflow" - Clear about creating and configuring projects  
-✅ "Document Upload and Processing Pipeline" - File handling from start to finish
-✅ "User Profile Management and Customization" - Profile editing capabilities
-✅ "E-commerce Product Discovery and Purchase Journey" - Shopping experience
-✅ "Customer Support Ticket Submission and Tracking" - Help desk workflow
-✅ "Content Publishing and Review Process" - Publishing workflow
-✅ "Team Collaboration and Communication Flow" - Team interaction patterns
-✅ "Financial Transaction and Payment Processing" - Money handling workflows
-✅ "Data Import, Validation, and Integration Process" - Data handling pipeline
-
-**What Makes a Great Flow Name**:
-1. **Action-Oriented**: Starts with what the user wants to accomplish
-2. **Complete Scope**: Indicates the full journey from start to finish  
-3. **Searchable**: Uses terms someone would search for
-4. **Professional**: Sounds like documentation someone would reference
-5. **Specific**: Clearly distinguishes from other workflows
-6. **Future-Proof**: Remains relevant as the application evolves
-
-**Bad Flow Names to Avoid**:
-❌ "dialog_flow" → ✅ "Modal Dialog Interaction and Form Submission Process"
-❌ "navigation_flow" → ✅ "Site Navigation and Content Discovery Journey"  
-❌ "form_flow" → ✅ "Data Entry, Validation, and Submission Workflow"
-❌ "menu_flow" → ✅ "Navigation Menu Exploration and Section Access"
-❌ "button_flow" → ✅ "Action Button Interaction and Response Handling"
-
-EDGE NAMING RULES:
-✅ GOOD EDGE DESCRIPTIONS (specific and clear):
-- "User clicks Upload button to open file selection dialog"
-- "System displays validation error after form submission"
-- "Navigation menu expands revealing section options"
-- "Login form validates credentials and redirects to dashboard"
-- "File preview appears after successful file selection"
-
-EDGE ACTION NAMING RULES:
-✅ GOOD ACTION NAMES (specific verbs):
-- "expand_navigation_menu" (not "click_menu")
-- "open_file_dialog" (not "click_upload")
-- "validate_login_form" (not "submit_form")
-- "display_error_message" (not "show_error")
-- "redirect_to_dashboard" (not "navigate")
-
-🔍 CONTEXT-BASED NAMING:
-Base your flow names on what you actually see in the screenshots:
-- If you see login forms → "User Authentication Process"
-- If you see file upload dialogs → "Document Upload Workflow" 
-- If you see shopping cart → "E-commerce Checkout Process"
-- If you see settings panels → "System Configuration Flow"
-- If you see search results → "Content Discovery Journey"
-- If you see dashboard elements → "User Portal Navigation"
-- If you see forms with validation → "Data Entry Validation Process"
-
-💡 FLOW ID GENERATION:
-Convert descriptive names to IDs by:
-- "User Authentication Process" → id: "user_authentication_process"
-- "File Upload Workflow" → id: "file_upload_workflow"  
-- "Modal Interaction Sequence" → id: "modal_interaction_sequence"
-
-📋 REQUIRED METADATA STRUCTURE:
-Every node MUST have complete metadata structure with ALL fields:
-{
-  "metadata": {
-    "visibleElements": ["Login form", "Email input", "Password field"],
-    "clickableElements": ["Submit button", "Forgot password link"],
-    "flowsConnected": ["user_authentication_process"], 
-    "dialogsOpen": [],
-    "timestamp": "2024-01-01T12:00:00Z",
-    "pageTitle": "Login Page"
-  }
-}
-
-⚠️ NEVER omit any metadata fields - use empty arrays [] if no elements exist
-
-🔥 CRITICAL REQUIREMENTS:
-1. **PRESERVE EVERYTHING**: Include ALL existing nodes, edges, flows, descriptions
-2. **VISUAL DEDUPLICATION**: Merge visually identical screenshots into single nodes
-3. **FLOW GROUPING**: Create logical workflow groupings with clear start/end states
-4. **ACTION PRECISION**: Use specific action names like "expand_navigation_menu"
-5. **NO DATA LOSS**: Your response completely replaces existing graph - don't lose anything
-6. **COMPREHENSIVE ANALYSIS**: Analyze every screenshot for visual elements and interactions
-7. **VISUAL CHANGE VALIDATION**: Only create edges when you can confirm visual differences
-8. **COMPLETE METADATA**: Every node MUST have complete metadata structure
-9. **STANDARD NAMING**: Initial image MUST be "step_0_initial"
-10. **FLOW EXPLANATIONS**: Use descriptive, human-readable flow names that explain the journey
-
-🚨 FINAL PRESERVATION WARNING:
-**YOUR RESPONSE MUST CONTAIN EVERY SINGLE EXISTING ITEM PLUS NEW CONTENT.**
-**NEVER DELETE, MODIFY, OR REORGANIZE EXISTING DATA.**
-**ONLY ADD NEW DISCOVERIES TO THE COMPLETE EXISTING STRUCTURE.**
-**MAINTAIN COMPLETE TIMELINE FROM STEP 0 TO CURRENT STEP.**`;
+}`;
 
       // Build interleaved conversation history for image analysis
       const interleavedMessages = this.buildInterleavedConversationHistory(
@@ -1891,34 +1814,38 @@ Every node MUST have complete metadata structure with ALL fields:
         content: [
           {
             type: "text",
-            text: `Analyze all the screenshots and create a comprehensive image-based flow diagram. Focus on:
+            text: `🚨 CRITICAL: Respond with ONLY valid JSON. No explanations, no markdown, no extra text.
 
-1. **Visual deduplication** of identical states
-2. **Flow pattern detection** (linear, branching, circular) 
-3. **Action transition mapping** between image states (ONLY when visual changes occur)
-4. **Comprehensive metadata** for each visual state
-5. **Complete preservation** of all existing graph data
+Analyze all the screenshots and create a comprehensive image-based flow diagram. Focus on:
 
-🚨 CRITICAL PRESERVATION REMINDER:
+1. Visual deduplication of identical states
+2. Flow pattern detection (linear, branching, circular) 
+3. Action transition mapping between image states (ONLY when visual changes occur)
+4. Comprehensive metadata for each visual state
+5. Complete preservation of all existing graph data
+
+CRITICAL PRESERVATION REMINDER:
 - Include EVERY existing node, edge, and flow EXACTLY as they are
 - Add new discoveries while preserving all existing data
 - Initial image MUST be named "step_0_initial"
 - Only create edges when screenshots show actual visual changes
 
-🔍 COMPLETE ANALYSIS INSTRUCTIONS:
-1. **ANALYZE EVERY SCREENSHOT** in the conversation history
-2. **CHECK ALL ACTIONS** performed during exploration
-3. **IDENTIFY ALL IMAGES** that should be included in flows
-4. **ENSURE EVERY IMAGE** is part of at least one flow
-5. **ADD MISSING IMAGES** to appropriate flows or create new flows
-6. **COMPLETE ALL EDGE LABELS** with detailed transition descriptions
-7. **VERIFY COMPLETE COVERAGE** from start to end
+COMPLETE ANALYSIS INSTRUCTIONS:
+1. ANALYZE EVERY SCREENSHOT in the conversation history
+2. CHECK ALL ACTIONS performed during exploration
+3. IDENTIFY ALL IMAGES that should be included in flows
+4. ENSURE EVERY IMAGE is part of at least one flow
+5. ADD MISSING IMAGES to appropriate flows or create new flows
+6. COMPLETE ALL EDGE LABELS with detailed transition descriptions
+7. VERIFY COMPLETE COVERAGE from start to end
 
 ${currentGraph ? "UPDATE the existing graph preserving ALL current data and adding any missing images/flows." : "CREATE a complete new visual flow diagram with ALL images included."}
 
-🎯 FINAL GOAL: Create a COMPLETE graph showing the ENTIRE user journey with EVERY image included in appropriate flows.
+FINAL GOAL: Create a COMPLETE graph showing the ENTIRE user journey with EVERY image included in appropriate flows.
 
-Remember: Compare each before/after image pair carefully. If the UI looks identical, don't create an edge for that action.`,
+Remember: Compare each before/after image pair carefully. If the UI looks identical, don't create an edge for that action.
+
+🚨 OUTPUT FORMAT: Respond with ONLY the JSON object. Start with { and end with }. No other text allowed.`,
           },
         ],
       });
@@ -1932,16 +1859,45 @@ Remember: Compare each before/after image pair carefully. If the UI looks identi
         existingFlows: currentGraph?.flows?.length || 0,
       });
 
-      // 🆕 USE GENERATEOBJECT FOR ROBUST JSON PARSING
-      const response = await generateObject({
-        model: vertex("gemini-2.5-flash"),
+      // Use regular generateText instead of generateObject
+      const response = await generateText({
+        model: vertex("gemini-2.5-pro"),
         system: systemPrompt,
-        maxTokens: 8000, // Increased for comprehensive analysis
+        maxTokens: 60000, // Increased for comprehensive analysis
         messages: interleavedMessages,
-        schema: InteractionGraphSchema,
       });
 
-      const graph = response.object as InteractionGraph;
+      // Store raw response first with versioning
+      const rawResponse = response.text;
+      const responseVersion = this.getNextResponseVersion(globalStore.urlHash);
+      this.fileManager.saveRawLLMResponse(
+        globalStore.urlHash,
+        responseVersion,
+        "interaction_graph",
+        rawResponse
+      );
+
+      // Parse the response with safety measures
+      let graph: InteractionGraph;
+      try {
+        const cleanedJson = this.extractJsonFromResponse(rawResponse);
+        const parsedResponse = JSON.parse(cleanedJson);
+        graph = InteractionGraphSchema.parse(parsedResponse);
+      } catch (error) {
+        logger.error(
+          `Failed to parse interaction graph response at version ${responseVersion}`,
+          {
+            urlHash: globalStore.urlHash,
+            version: responseVersion,
+            error: error instanceof Error ? error.message : String(error),
+            rawResponseLength: rawResponse.length,
+            rawResponsePreview: rawResponse.substring(0, 500),
+          }
+        );
+        throw new Error(
+          `Interaction graph parsing failed at version ${responseVersion}: ${error instanceof Error ? error.message : String(error)}`
+        );
+      }
 
       // Validate that we have the expected structure
       if (!graph.nodes || !graph.edges || !graph.flows) {
@@ -2135,345 +2091,6 @@ Remember: Compare each before/after image pair carefully. If the UI looks identi
       hash = hash & hash; // Convert to 32-bit integer
     }
     return Math.abs(hash).toString(16).substring(0, 8); // 8 character hex hash
-  }
-
-  /**
-   * Generate navigation graph when page changes occur
-   * Creates a special node with placeholder image for page transitions
-   */
-  async generatePageChangeNavigationGraph(
-    sourcePageStore: PageStore,
-    currentGraph: InteractionGraph | undefined,
-    navigationAction: string,
-    sourceUrl: string,
-    targetUrl: string
-  ): Promise<InteractionGraph | null> {
-    try {
-      logger.info(`🔗 Generating page change navigation graph`, {
-        sourceUrl,
-        targetUrl,
-        action: navigationAction,
-      });
-
-      // Create page transition placeholder image URL
-      const pageTransitionImageUrl =
-        "https://cdn.dribbble.com/userupload/37152919/file/original-2223c68ac929d569c5204e50ab0d302c.png?resize=1504x1128&vertical=center";
-
-      const systemPrompt = `You are an expert UI/UX analyst creating navigation graphs for page-to-page transitions.
-
-${this.flowNamingGuidelines}
-${this.edgeNamingGuidelines}
-
-🚨 CRITICAL DATA PRESERVATION WARNING:
-Your response will COMPLETELY REPLACE the existing graph. You are STRICTLY FORBIDDEN from losing ANY existing data.
-You MUST include EVERY SINGLE existing node, edge, and flow EXACTLY as they are, plus the new page navigation.
-
-⚠️ ABSOLUTE PRESERVATION REQUIREMENTS:
-- **NEVER MODIFY** existing flows - keep them exactly as they are
-- **NEVER REMOVE** existing nodes or edges - preserve all previous states
-- **NEVER CHANGE** existing flow names, descriptions, or structures
-- **ONLY ADD** new page navigation to existing flows or create new flows
-- **MAINTAIN COMPLETE HISTORY** from the very first step to the current state
-- **PRESERVE ALL TIMESTAMPS** and metadata exactly as they were
-- **KEEP ALL VISUAL STATES** in chronological order without gaps
-
-🔍 COMPLETE ANALYSIS REQUIREMENT:
-You MUST analyze the ENTIRE navigation history and ALL page states to create a COMPLETE graph:
-- **EVERY PAGE STATE MUST BE INCLUDED** in at least one flow - this is COMPULSORY
-- **NO PAGE TRANSITION CAN BE LEFT OUT** - if a page exists, it must be part of a flow
-- **ANALYZE ALL PAGE SCREENSHOTS** from the navigation history
-- **CHECK ALL NAVIGATION ACTIONS** performed during exploration
-- **IDENTIFY MISSING PAGE STATES** that aren't in existing flows
-- **ADD MISSING PAGE STATES** to appropriate flows or create new flows
-- **COMPLETE EDGE LABELS** for all page-to-page transitions
-- **FULL NAVIGATION COVERAGE** from the very beginning to the very end
-
-🌐 PAGE CHANGE NAVIGATION OVERVIEW:
-You are creating a navigation relationship between two different pages:
-- **SOURCE PAGE**: ${sourceUrl}
-- **TARGET PAGE**: ${targetUrl}  
-- **NAVIGATION ACTION**: ${navigationAction}
-
-🎯 YOUR RESPONSIBILITIES:
-1. **PRESERVE ALL EXISTING DATA**: Include every existing node, edge, and flow
-2. **ADD PAGE TRANSITION**: Create a new node representing the target page
-3. **CREATE NAVIGATION EDGE**: Connect source page to target page via the action
-4. **MAINTAIN FLOW CONTINUITY**: Ensure navigation fits into existing flows
-
-📝 SOURCE PAGE DATA:
-- URL: ${sourcePageStore.url}
-- Total Actions on Source: ${sourcePageStore.actionHistory.length}
-- Available Image States: ${sourcePageStore.actionHistory.length + 1} (including initial)
-
-${
-  currentGraph
-    ? `
-🔒 EXISTING GRAPH DATA TO PRESERVE COMPLETELY:
-YOU ARE ABSOLUTELY FORBIDDEN FROM LOSING ANY OF THIS DATA.
-
-🚨 STRICT PRESERVATION RULES:
-- **COPY EVERYTHING EXACTLY** - do not modify, remove, or change anything
-- **MAINTAIN COMPLETE TIMELINE** from step 0 to current step
-- **PRESERVE ALL FLOW STRUCTURES** exactly as they are
-- **KEEP ALL NODE CONNECTIONS** and relationships intact
-- **NEVER REORGANIZE** existing flows or change their names
-- **ONLY ADD NEW CONTENT** to existing flows or create new flows
-
-CURRENT STATISTICS:
-- Image Nodes: ${currentGraph.nodes.length} (PRESERVE ALL)
-- Edges: ${currentGraph.edges.length} (PRESERVE ALL)  
-- Flows: ${currentGraph.flows?.length || 0} (PRESERVE ALL)
-
-EXISTING IMAGE NODES (PRESERVE EVERY SINGLE ONE):
-${currentGraph.nodes.map((node) => `- ${node.id}: Step ${node.stepNumber} | Action: "${node.instruction}" | Flows: [${node.metadata.flowsConnected.join(", ")}]`).join("\n")}
-
-EXISTING EDGES (PRESERVE EVERY SINGLE ONE):
-${currentGraph.edges.map((edge) => `- ${edge.from} → ${edge.to}: ${edge.action} | ${edge.description}`).join("\n")}
-
-EXISTING FLOWS (PRESERVE EVERY SINGLE ONE):
-${currentGraph.flows?.map((flow) => `- ${flow.id}: ${flow.name} (${flow.flowType}) | Images: [${flow.imageNodes.join(", ")}]`).join("\n") || "No existing flows"}
-
-🚨 CRITICAL: Your response replaces everything. Include ALL existing items above PLUS the new page navigation.
-**NEVER REMOVE OR MODIFY** any of the above data - only add new content.
-
-🔍 COMPLETE NAVIGATION GRAPH VERIFICATION:
-Before finalizing your response, verify that:
-1. **EVERY PAGE STATE** from the navigation history is included in at least one flow
-2. **ALL NAVIGATION EDGES** have complete labels describing the page transitions
-3. **ALL FLOWS** cover the complete navigation journey from start to end
-4. **NO PAGE STATES** are left out or missing from flows
-5. **COMPLETE NAVIGATION TIMELINE** is maintained from first page to final page
-
-🎯 YOUR GOAL: Create a COMPLETE navigation graph that shows the ENTIRE page-to-page journey with EVERY page state included in appropriate flows.
-`
-    : "No existing graph - creating first navigation relationship."
-}
-
-🌍 PAGE TRANSITION NODE REQUIREMENTS:
-Create a new node for the target page with these specifications:
-- **ID**: "page_transition_${this.generateImageHashFromData(targetUrl)}"
-- **imageName**: Same as ID
-- **imageData**: Use placeholder URL: "${pageTransitionImageUrl}"
-- **instruction**: "${navigationAction}"
-- **stepNumber**: ${(sourcePageStore.actionHistory.length || 0) + 1}
-- **metadata**: 
-  - visibleElements: ["New page loading", "Page transition", "Target page content"]
-  - clickableElements: []
-  - flowsConnected: ["inter_page_navigation_flow"]
-  - dialogsOpen: []
-  - timestamp: Current ISO timestamp
-  - pageTitle: Extract from target URL or use "Navigation Target"
-
-🔗 NAVIGATION EDGE REQUIREMENTS:
-Create an edge connecting the source page to target page:
-- **from**: Last action node from source page OR "step_0_initial" if no actions
-- **to**: The new page transition node ID
-- **action**: "navigate_to_new_page"
-- **instruction**: "${navigationAction}"
-- **description**: "User navigates from ${sourceUrl} to ${targetUrl} via ${navigationAction}"
-- **flowId**: "inter_page_navigation_flow"
-
-🌊 NAVIGATION FLOW REQUIREMENTS:
-Create or update the "Inter-Page Navigation Flow":
-- **id**: "inter_page_navigation_flow"
-- **name**: "Inter-Page Navigation Journey"
-- **description**: "Cross-page navigation tracking user movement between different URLs"
-- **flowType**: "branching"
-- Include both source and target page nodes
-
-🔥 CRITICAL REQUIREMENTS:
-1. **PRESERVE EVERYTHING**: Include ALL existing nodes, edges, flows exactly as they are
-2. **ADD PAGE TRANSITION**: Create new node for target page with placeholder image
-3. **CREATE NAVIGATION LINK**: Connect source to target via navigation edge
-4. **MAINTAIN FLOW STRUCTURE**: Keep all existing flows and add navigation flow
-5. **NO DATA LOSS**: Your response completely replaces existing graph
-6. **STANDARD NAMING**: Use consistent ID patterns for page transitions
-
-🚨 FINAL PRESERVATION WARNING:
-**YOUR RESPONSE MUST CONTAIN EVERY SINGLE EXISTING ITEM PLUS NEW CONTENT.**
-**NEVER DELETE, MODIFY, OR REORGANIZE EXISTING DATA.**
-**ONLY ADD NEW DISCOVERIES TO THE COMPLETE EXISTING STRUCTURE.**`;
-
-      // Use a simple prompt for page navigation without complex image analysis
-      const messages = [
-        {
-          role: "user" as const,
-          content: [
-            {
-              type: "text" as const,
-              text: `Create a navigation graph showing the transition from ${sourceUrl} to ${targetUrl} via action: "${navigationAction}".
-
-🚨 CRITICAL PRESERVATION:
-- Include ALL existing nodes, edges, and flows EXACTLY as they are
-- Add new page transition node with placeholder image
-- Create navigation edge connecting the pages
-- Maintain all existing flow structures
-
-${currentGraph ? "UPDATE the existing graph preserving ALL data while adding the page navigation." : "CREATE new graph with the page navigation relationship."}`,
-            },
-          ],
-        },
-      ];
-
-      // Use generateObject for robust parsing
-      const response = await generateObject({
-        model: vertex("gemini-2.5-flash"),
-        system: systemPrompt,
-        maxTokens: 6000,
-        messages,
-        schema: InteractionGraphSchema,
-      });
-
-      const graph = response.object as InteractionGraph;
-
-      // Validate structure
-      if (!graph.nodes || !graph.edges || !graph.flows) {
-        throw new Error("Invalid navigation graph structure");
-      }
-
-      // Map real image data for existing nodes
-      const imageDataMap = new Map<string, string>();
-
-      // Add initial screenshot
-      imageDataMap.set("step_0_initial", sourcePageStore.initialScreenshot);
-
-      // Add action screenshots from source page
-      sourcePageStore.actionHistory.forEach((action) => {
-        imageDataMap.set(action.imageName, action.after_act);
-      });
-
-      // Update nodes with real image data (except page transition node which keeps placeholder)
-      graph.nodes.forEach((node) => {
-        if (node.id.startsWith("page_transition_")) {
-          // Keep the placeholder image for page transitions
-          node.imageData = pageTransitionImageUrl;
-        } else {
-          const realImageData =
-            imageDataMap.get(node.imageName) || imageDataMap.get(node.id);
-          if (realImageData) {
-            node.imageData = realImageData;
-          } else {
-            logger.warn(
-              `⚠️ No image data found for navigation node: ${node.imageName}`
-            );
-            node.imageData =
-              "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg==";
-          }
-        }
-      });
-
-      logger.info(`📊 Generated page navigation graph`, {
-        sourceUrl,
-        targetUrl,
-        navigationAction,
-        totalNodes: graph.nodes.length,
-        totalEdges: graph.edges.length,
-        totalFlows: graph.flows.length,
-        preservedFromExisting: currentGraph
-          ? {
-              nodes: currentGraph.nodes.length,
-              edges: currentGraph.edges.length,
-              flows: currentGraph.flows?.length || 0,
-            }
-          : "new_navigation_graph",
-      });
-
-      return graph;
-    } catch (error) {
-      logger.error("❌ Failed to generate page navigation graph", {
-        error: error instanceof Error ? error.message : String(error),
-        sourceUrl,
-        targetUrl,
-        navigationAction,
-      });
-      return null;
-    }
-  }
-
-  /**
-   * UNIFIED GRAPH GENERATION METHOD
-   * Handles both interaction graphs (same page) and page navigation graphs (page changes)
-   * This combines the functionality of generateInteractionGraph and generatePageChangeNavigationGraph
-   */
-  async generateUnifiedInteractionGraph(
-    globalStore: PageStore,
-    currentGraph: InteractionGraph | undefined,
-    options?: {
-      isPageNavigation?: boolean;
-      navigationAction?: string;
-      sourceUrl?: string;
-      targetUrl?: string;
-    }
-  ): Promise<InteractionGraph | null> {
-    try {
-      const isPageNavigation = options?.isPageNavigation || false;
-
-      if (
-        isPageNavigation &&
-        options?.navigationAction &&
-        options?.sourceUrl &&
-        options?.targetUrl
-      ) {
-        // Handle page navigation case with enhanced naming
-        return this.generatePageChangeNavigationGraph(
-          globalStore,
-          currentGraph,
-          options.navigationAction,
-          options.sourceUrl,
-          options.targetUrl
-        );
-      } else {
-        // Handle same-page interaction case with enhanced naming
-        return this.generateInteractionGraph(globalStore, currentGraph);
-      }
-    } catch (error) {
-      logger.error("❌ Failed to generate unified interaction graph", {
-        error: error instanceof Error ? error.message : String(error),
-        url: globalStore.url,
-        isPageNavigation: options?.isPageNavigation || false,
-      });
-      return null;
-    }
-  }
-
-  /**
-   * SMART IMAGE HANDLING FOR NODES
-   * Handles both page navigation and interaction nodes
-   */
-  private handleNodeImageData(
-    node: ImageNode,
-    imageDataMap: Map<string, string>,
-    pageTransitionImageUrl?: string
-  ): void {
-    // Case 1: Node already has a URL - preserve it
-    if (node.imageData.startsWith("http")) {
-      return;
-    }
-
-    // Case 2: Page transition node - use transition image
-    if (pageTransitionImageUrl && node.id.startsWith("page_transition_")) {
-      node.imageData = pageTransitionImageUrl;
-      return;
-    }
-
-    // Case 3: Try to find real image data
-    const realImageData =
-      imageDataMap.get(node.imageName) || imageDataMap.get(node.id);
-    if (realImageData) {
-      node.imageData = realImageData;
-      return;
-    }
-
-    // Case 4: If node has URL metadata, use that instead of placeholder
-    if ((node.metadata as any)?.url) {
-      node.imageData = (node.metadata as any).url;
-      return;
-    }
-
-    // Case 5: Fallback to transparent pixel
-    logger.warn(`⚠️ No image data found for node: ${node.imageName}`);
-    node.imageData =
-      "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg==";
   }
 
   /**

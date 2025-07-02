@@ -1,4 +1,11 @@
-import { LLMDecisionResponse, PageExtractResponse, PageActResponse, UserInputResponse, PageData, ActionHistoryEntry } from "../types/exploration.js";
+import {
+  LLMDecisionResponse,
+  PageExtractResponse,
+  PageActResponse,
+  UserInputResponse,
+  PageData,
+  ActionHistoryEntry,
+} from "../types/exploration.js";
 
 /**
  * Interface for LLM client functionality
@@ -59,18 +66,4 @@ export interface ILLMClient {
     urlHash: string,
     stepNumber: number
   ): Promise<UserInputResponse | null>;
-
-  /**
-   * Format extraction results into markdown
-   */
-  formatExtractionResults(
-    screenshots: Buffer[],
-    url: string,
-    objective: string,
-    urlHash: string,
-    stepNumber: number,
-    previousExtractions: any[],
-    previousMarkdowns: string[],
-    currentExtractionData: any
-  ): Promise<string | null>;
-} 
+}
