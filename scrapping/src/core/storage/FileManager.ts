@@ -1,9 +1,9 @@
 import fs from "fs";
 import path from "path";
 import crypto from "crypto";
-import { SessionMetadata, PageData } from "../types/exploration.js";
+import { SessionMetadata, PageData } from "../../types/exploration.js";
 import type { Socket } from "socket.io";
-import logger from "../utils/logger.js";
+import logger from "../../utils/logger.js";
 
 export class FileManager {
   private baseDir: string;
@@ -11,10 +11,14 @@ export class FileManager {
   private socket?: Socket;
   private userName?: string;
 
-  constructor(private sessionId: string, socket?: Socket, userName?: string) {
+  constructor(
+    private sessionId: string,
+    socket?: Socket,
+    userName?: string
+  ) {
     this.socket = socket;
     this.userName = userName;
-    
+
     // Use userName as base directory if provided, otherwise use exploration_sessions
     this.baseDir = userName ? userName : "exploration_sessions";
     this.sessionDir = path.join(this.baseDir, sessionId);
@@ -28,10 +32,13 @@ export class FileManager {
       const userDir = path.join(process.cwd(), userName);
       if (fs.existsSync(userDir)) {
         fs.rmSync(userDir, { recursive: true, force: true });
-        logger.info('🗑️ Cleaned up user session directory', { userName, path: userDir });
+        logger.info("🗑️ Cleaned up user session directory", {
+          userName,
+          path: userDir,
+        });
       }
     } catch (error) {
-      logger.error('❌ Failed to cleanup user sessions', { userName, error });
+      logger.error("❌ Failed to cleanup user sessions", { userName, error });
     }
   }
 
@@ -44,7 +51,11 @@ export class FileManager {
       const urlObj = new URL(url);
       // Include hash fragment to distinguish between different SPA routes
       const normalizedUrl = `${urlObj.protocol}//${urlObj.host}${urlObj.pathname}${urlObj.hash}`;
-      const hash = crypto.createHash('md5').update(normalizedUrl).digest('hex').substring(0, 8);
+      const hash = crypto
+        .createHash("md5")
+        .update(normalizedUrl)
+        .digest("hex")
+        .substring(0, 8);
 
       // Create readable folder name
       const domain = urlObj.hostname.replace(/^www\./, "").replace(/\./g, "-");
@@ -52,13 +63,13 @@ export class FileManager {
         urlObj.pathname === "/"
           ? "home"
           : urlObj.pathname.replace(/[^a-zA-Z0-9]/g, "-").substring(0, 20);
-      
+
       // Include hash part in folder name for SPA routes
-      const hashPart = urlObj.hash 
+      const hashPart = urlObj.hash
         ? urlObj.hash.replace(/[^a-zA-Z0-9]/g, "-").substring(0, 15)
         : "";
 
-      return hashPart 
+      return hashPart
         ? `${domain}_${pathPart}${hashPart}_${hash}`
         : `${domain}_${pathPart}_${hash}`;
     } catch {
@@ -83,11 +94,11 @@ export class FileManager {
     // Create urls subdirectory
     const urlsDir = path.join(this.sessionDir, "urls");
     fs.mkdirSync(urlsDir, { recursive: true });
-    
-    logger.info('📁 Initialized session directory', { 
-      sessionDir: this.sessionDir, 
+
+    logger.info("📁 Initialized session directory", {
+      sessionDir: this.sessionDir,
       userName: this.userName,
-      baseDir: this.baseDir 
+      baseDir: this.baseDir,
     });
   }
 
@@ -154,8 +165,8 @@ export class FileManager {
 
     // Emit screenshot event to frontend
     if (this.socket && this.userName) {
-      this.socket.emit('exploration_update', {
-        type: 'screenshot_captured',
+      this.socket.emit("exploration_update", {
+        type: "screenshot_captured",
         timestamp: new Date().toISOString(),
         data: {
           userName: this.userName,
@@ -164,8 +175,8 @@ export class FileManager {
           action,
           filename,
           screenshotPath,
-          screenshotBase64: buffer.toString('base64')
-        }
+          screenshotBase64: buffer.toString("base64"),
+        },
       });
     }
 
@@ -205,10 +216,41 @@ export class FileManager {
       phase,
       timestamp: new Date().toISOString(),
       response: response,
-      raw_response: JSON.stringify(response, null, 2),
     };
 
     fs.writeFileSync(responsePath, JSON.stringify(responseData, null, 2));
+    return responsePath;
+  }
+
+  /**
+   * Save raw LLM response with versioning
+   */
+  saveRawLLMResponse(
+    urlHash: string,
+    version: string,
+    responseType: string,
+    rawResponse: string
+  ): string {
+    const filename = `${responseType}_${version}.txt`;
+    const responsePath = path.join(
+      this.sessionDir,
+      "urls",
+      urlHash,
+      "llm_responses",
+      filename
+    );
+
+    // Create llm_responses directory if it doesn't exist
+    const responseDir = path.join(
+      this.sessionDir,
+      "urls",
+      urlHash,
+      "llm_responses"
+    );
+    fs.mkdirSync(responseDir, { recursive: true });
+
+    fs.writeFileSync(responsePath, rawResponse);
+
     return responsePath;
   }
 

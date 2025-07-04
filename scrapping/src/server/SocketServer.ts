@@ -3,12 +3,15 @@ import { createServer } from "http";
 import fs from "fs";
 import path from "path";
 import logger from "../utils/logger.js";
-import { WebExplorer } from "./WebExplorer.js";
-import { FileManager } from "./FileManager.js";
+import {
+  WebExplorer,
+  FileManager,
+  GlobalStagehandClient,
+} from "../core/index.js";
 import { Stagehand } from "@browserbasehq/stagehand";
 import { chromium } from "playwright";
-import { GlobalStagehandClient } from "./GlobalStagehandClient.js";
 import { anthropic } from "@ai-sdk/anthropic";
+import { vertex } from "@ai-sdk/google-vertex";
 
 interface ExecutionCommand {
   userName: string;
@@ -89,17 +92,69 @@ export class SocketServer {
         });
       });
 
-      // Handle user input response (updated for multiple inputs)
+      // Handle user input response (updated for multiple inputs and skip)
       socket.on(
         "user_input_response",
-        (data: { inputs: { [key: string]: string } }) => {
-          logger.info("📥 Received user input response", {
-            inputKeys: Object.keys(data.inputs),
-          });
+        (data: { inputs?: { [key: string]: string }; isSkipped?: boolean }) => {
+          if (data.isSkipped) {
+            logger.info("⏭️ Received user input skip request");
+          } else if (data.inputs) {
+            logger.info("📥 Received user input response", {
+              inputKeys: Object.keys(data.inputs),
+            });
+          } else {
+            logger.warn(
+              "⚠️ Invalid user input response - no inputs or skip signal"
+            );
+          }
           // The input response is automatically handled by the WebExplorer's toolUserInput method
           // which is listening for this event on the same socket
         }
       );
+
+      // 🆕 Handle chat messages from user
+      // socket.on(
+      //   "chat_message",
+      //   async (data: { userName: string; message: string }) => {
+      //     console.log("💬 Received chat message", data);
+      //     try {
+      //       logger.info("💬 Received chat message", {
+      //         userName: data.userName,
+      //         message: data.message.substring(0, 100),
+      //       });
+
+      //       const explorer = this.activeExplorations.get(data.userName);
+      //       if (explorer && "handleChatMessage" in explorer) {
+      //         // TypeScript cast to access the handleChatMessage method
+      //         await (explorer as any).handleChatMessage(data.message);
+      //       } else {
+      //         logger.warn("⚠️ No active explorer found for chat message", {
+      //           userName: data.userName,
+      //           activeExplorers: Array.from(this.activeExplorations.keys()),
+      //         });
+
+      //         socket.emit("chat_error", {
+      //           userName: data.userName,
+      //           error:
+      //             "No active exploration session found. Please start an exploration first.",
+      //           timestamp: new Date().toISOString(),
+      //         });
+      //       }
+      //     } catch (error) {
+      //       console.log("Error in handleChatMessage:", error);
+      //       logger.error("❌ Failed to handle chat message", {
+      //         error,
+      //         userName: data.userName,
+      //       });
+
+      //       socket.emit("chat_error", {
+      //         userName: data.userName,
+      //         error: "Failed to process chat message. Please try again.",
+      //         timestamp: new Date().toISOString(),
+      //       });
+      //     }
+      //   }
+      // );
 
       socket.on("disconnect", () => {
         logger.info("🔌 Client disconnected", { socketId: socket.id });
@@ -144,7 +199,7 @@ export class SocketServer {
 
     try {
       const openaiClient = new GlobalStagehandClient({
-        model: anthropic("claude-3-5-sonnet-20241022"),
+        model: vertex("gemini-1.5-pro-002"),
       });
       // Create Stagehand client (which creates its own browser and page)
       const stagehand = new Stagehand({
@@ -152,7 +207,7 @@ export class SocketServer {
         verbose: 1,
         llmClient: openaiClient,
         localBrowserLaunchOptions: {
-          headless: false,
+          headless: true,
         },
         browserbaseSessionCreateParams: {
           projectId: process.env.BROWSERBASE_PROJECT_ID!,

@@ -1,5 +1,5 @@
 import "dotenv/config";
-import { SocketServer } from './services/SocketServer.js';
+import { SocketServer } from './server/index.js';
 import logger from './utils/logger.js';
 
 async function startSocketServer() {

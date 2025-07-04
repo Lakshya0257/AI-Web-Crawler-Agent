@@ -1,38 +1,42 @@
 import { Browser, Page } from "playwright";
 import { Stagehand } from "@browserbasehq/stagehand";
-import { z } from "zod";
 import fs from "fs";
 import path from "path";
-import logger from "../utils/logger.js";
-import { FileManager } from "./FileManager.js";
-import { LLMClient } from "./LLMClient.js";
+import logger from "../../utils/logger.js";
+import { FileManager } from "../storage/FileManager.js";
+import { GlobalStore, TreeNode } from "../storage/GlobalStore.js";
+import { LLMClient } from "../llm/LLMClient.js";
+import { ChatAgent, ExplorationCheckpoint, ChatDecision } from "./ChatAgent.js";
 import {
   ExplorationSession,
-  SessionMetadata,
   PageData,
   ExecutedStep,
-  UserInputData,
-  FlowContext,
-  ExtractionResult,
-  PageScreenshot,
-} from "../types/exploration.js";
+} from "../../types/exploration.js";
 import type { Socket } from "socket.io";
+import Langfuse from "langfuse";
 
 export class WebExplorer {
   protected session: ExplorationSession;
   private fileManager: FileManager;
+  private globalStore: GlobalStore;
   private llmClient: LLMClient;
+  private chatAgent: ChatAgent;
   private stagehand: Stagehand;
   private sessionDecisionHistory: any[] = []; // Track all decisions made during the session
   private isExplorationObjective: boolean; // Add exploration mode detection
-  private activeProcessingPromises: Map<string, Promise<void>> = new Map(); // Track background processing
-  protected pageLinkages: Map<string, string[]> = new Map(); // Track which page leads to which pages
   private maxPagesToExplore: number; // Maximum pages to explore
   protected socket?: Socket;
   protected userName?: string;
   private activeExplorations?: Map<string, WebExplorer>; // Reference to activeExplorations from SocketServer
   private additionalContext?: string;
   private canLogin: boolean;
+  private langfuse: Langfuse;
+  private langfuseTraceId: string;
+
+  // 🆕 Chat and Checkpoint System
+  private explorationCheckpoint?: ExplorationCheckpoint;
+  private isInterrupted: boolean = false;
+  private browserShouldStayOpen: boolean = true;
 
   constructor(
     private browser: Browser,
@@ -55,16 +59,36 @@ export class WebExplorer {
     this.activeExplorations = activeExplorations;
     this.additionalContext = additionalContext;
     this.canLogin = canLogin;
+    this.langfuse = new Langfuse();
+    this.langfuseTraceId = `user-${userName}-${objective}-${Date.now()}`;
+    this.langfuse.trace({
+      id: this.langfuseTraceId,
+    });
 
     // Use the provided isExploration boolean instead of detecting from objective
     this.isExplorationObjective = isExploration;
 
     const sessionId = FileManager.generateSessionId(startUrl);
     this.fileManager = new FileManager(sessionId, socket, userName);
+
+    // Initialize GlobalStore with session directory
+    const baseDir = userName ? userName : "exploration_sessions";
+    const sessionDir = path.join(baseDir, sessionId);
+    this.globalStore = new GlobalStore(sessionDir, socket, userName);
+
     this.llmClient = new LLMClient(
       this.fileManager,
       this.additionalContext,
       this.canLogin
+    );
+
+    // Initialize ChatAgent for handling user interruptions
+    this.chatAgent = new ChatAgent(
+      this.page,
+      this.globalStore,
+      this.fileManager,
+      socket,
+      userName
     );
 
     // Initialize session
@@ -113,11 +137,29 @@ export class WebExplorer {
     if (maxPagesToExplore !== undefined) {
       this.maxPagesToExplore = maxPagesToExplore;
     }
+
     try {
+      // Load any existing checkpoint
+      this.loadCheckpoint();
+
       // Add starting URL to queue
       await this.addUrlToQueue(this.session.metadata.startUrl, 1);
 
-      return await this.exploreSequentially();
+      // Start exploration (will pause for chat and resume as needed)
+      const result = await this.exploreSequentially();
+
+      // After exploration completes, keep browser open for chat
+      if (this.browserShouldStayOpen) {
+        logger.info(`🌐 Exploration completed, browser staying open for chat`, {
+          finalResult: result,
+          pagesExplored: this.session.metadata.totalPagesDiscovered,
+        });
+
+        // Don't close browser - wait for chat messages
+        // The browser lifecycle will be managed externally
+      }
+
+      return result;
     } catch (error) {
       logger.error("❌ Exploration failed", {
         error: error instanceof Error ? error.message : String(error),
@@ -132,12 +174,17 @@ export class WebExplorer {
   private async exploreSequentially(): Promise<boolean> {
     // Main exploration loop - sequential processing
     while (this.session.pageQueue.length > 0) {
-      // Check if user is still active
-      if (!this.isUserStillActive()) {
-        logger.info(
-          "🛑 Stopping sequential exploration - user no longer active"
-        );
-        return await this.finalizeSession(false);
+      // Check if exploration should continue (not interrupted by chat)
+      if (!this.shouldContinueExploration()) {
+        if (this.isInterrupted) {
+          logger.info("⏸️ Sequential exploration paused for chat");
+          return true; // Return true to indicate graceful pause, not failure
+        } else {
+          logger.info(
+            "🛑 Stopping sequential exploration - user no longer active"
+          );
+          return await this.finalizeSession(false);
+        }
       }
 
       if (this.session.metadata.objectiveAchieved) {
@@ -152,91 +199,9 @@ export class WebExplorer {
       await this.processPage(pageData);
     }
 
+    // await this.langfuse.flushAsync();
+
     return await this.finalizeSession(false);
-  }
-
-  /**
-   * Background processing exploration for exploration objectives
-   */
-  private async exploreWithBackgroundProcessing(): Promise<boolean> {
-    logger.info("🔍 Starting exploration mode with background processing");
-
-    // Process pages with background processing
-    while (true) {
-      // Check if user is still active
-      if (!this.isUserStillActive()) {
-        logger.info(
-          "🛑 Stopping background exploration - user no longer active"
-        );
-        return await this.finalizeSession(false);
-      }
-
-      // Check if objective is achieved
-      if (this.session.metadata.objectiveAchieved) {
-        logger.info("✅ Objective achieved!");
-        // Wait for all background processing to complete
-        await this.waitForAllProcessingToComplete();
-        return await this.finalizeSession(true);
-      }
-
-      // Check if we have queued pages to process
-      if (this.session.pageQueue.length > 0) {
-        // Get next page from queue
-        const urlHash = this.session.pageQueue.shift()!;
-        const pageData = this.session.pages.get(urlHash)!;
-
-        // Start processing in background (don't await)
-        const processingPromise = this.processPage(pageData).finally(() => {
-          // Clean up completed promise
-          this.activeProcessingPromises.delete(urlHash);
-        });
-
-        // Track the processing promise
-        this.activeProcessingPromises.set(urlHash, processingPromise);
-
-        logger.info(`🔄 Started background processing for: ${pageData.url}`, {
-          activeProcessing: this.activeProcessingPromises.size,
-          queueRemaining: this.session.pageQueue.length,
-        });
-
-        // Small delay to prevent overwhelming the system
-        await new Promise((resolve) => setTimeout(resolve, 1000));
-      } else {
-        // No more queued pages, check if all processing is complete
-        if (this.activeProcessingPromises.size === 0) {
-          // All pages have been processed
-          const allPagesCompleted = this.areAllPagesCompleted();
-          if (allPagesCompleted) {
-            logger.info("✅ All pages completed in exploration mode");
-            return await this.finalizeSession(false);
-          } else {
-            // Wait a bit and check again (some pages might still be processing)
-            await new Promise((resolve) => setTimeout(resolve, 2000));
-          }
-        } else {
-          // Wait for some processing to complete
-          logger.info(`⏳ Waiting for background processing to complete...`, {
-            activeProcessing: this.activeProcessingPromises.size,
-          });
-          await new Promise((resolve) => setTimeout(resolve, 3000));
-        }
-      }
-    }
-  }
-
-  /**
-   * Wait for all active processing to complete
-   */
-  private async waitForAllProcessingToComplete(): Promise<void> {
-    if (this.activeProcessingPromises.size > 0) {
-      logger.info(
-        `⏳ Waiting for ${this.activeProcessingPromises.size} background processes to complete...`
-      );
-      await Promise.allSettled(
-        Array.from(this.activeProcessingPromises.values())
-      );
-      this.activeProcessingPromises.clear();
-    }
   }
 
   /**
@@ -255,10 +220,15 @@ export class WebExplorer {
    * Process a single page with tool-driven approach
    */
   protected async processPage(pageData: PageData): Promise<void> {
-    // Check if user is still active before processing page
-    if (!this.isUserStillActive()) {
-      logger.info(`🛑 Stopping page processing - user no longer active`);
-      return;
+    // Check if exploration should continue before processing page
+    if (!this.shouldContinueExploration()) {
+      if (this.isInterrupted) {
+        logger.info(`⏸️ Page processing paused for chat: ${pageData.url}`);
+        return; // Gracefully exit to allow chat handling
+      } else {
+        logger.info(`🛑 Stopping page processing - user no longer active`);
+        return;
+      }
     }
 
     logger.info(`🔍 Processing page: ${pageData.url}`);
@@ -294,7 +264,9 @@ export class WebExplorer {
       let stepsOnThisPage = 0;
 
       // Take initial screenshot of the page
+      console.log("Time of initial screenshot:", new Date().toISOString());
       const screenshotBuffer = await this.page.screenshot({ fullPage: true });
+      console.log("Time of initial screenshot:", new Date().toISOString());
 
       // Save initial page screenshot
       const initialScreenshotPath = this.fileManager.saveScreenshot(
@@ -315,21 +287,36 @@ export class WebExplorer {
 
       logger.info(`📸 Initial page screenshot saved: ${initialScreenshotPath}`);
 
-      const conversationHistory: Array<{
-        role: "user" | "assistant";
-        content: string;
-      }> = [];
+      // Initialize page in GlobalStore with initial screenshot
+      this.globalStore.initializePage(
+        pageData.url,
+        pageData.urlHash,
+        `data:image/png;base64,${screenshotBuffer.toString("base64")}`
+      );
+
+      // Get page-level conversation history from GlobalStore
+      const conversationHistory = this.globalStore.getConversationHistory(
+        pageData.urlHash
+      );
 
       while (
-        stepsOnThisPage < maxStepsPerPage &&
-        !this.session.metadata.objectiveAchieved
+        // stepsOnThisPage < maxStepsPerPage &&
+        !this.session.metadata.objectiveAchieved &&
+        this.shouldContinueExploration() // 🆕 Check for chat interruption at step level
       ) {
-        // Check if user is still active before each step
-        if (!this.isUserStillActive()) {
-          logger.info(
-            `🛑 Stopping page processing loop - user no longer active`
-          );
-          return;
+        // Check if exploration should continue (not interrupted by chat)
+        if (!this.shouldContinueExploration()) {
+          if (this.isInterrupted) {
+            logger.info(
+              `⏸️ Page processing paused for chat at step ${this.session.globalStepCounter}`
+            );
+            return; // Gracefully exit to allow chat handling
+          } else {
+            logger.info(
+              `🛑 Stopping page processing loop - user no longer active`
+            );
+            return;
+          }
         }
 
         // Ask LLM to decide which tool to use next
@@ -342,38 +329,76 @@ export class WebExplorer {
         const maxPagesReached =
           this.session.metadata.totalPagesDiscovered >= this.maxPagesToExplore;
 
-        // Check if user is still active before LLM call
-        if (!this.isUserStillActive()) {
-          logger.info(
-            `🛑 Stopping before LLM decision - user no longer active`
-          );
-          return;
+        // Check if exploration should continue before LLM call
+        if (!this.shouldContinueExploration()) {
+          if (this.isInterrupted) {
+            logger.info(
+              `⏸️ Page processing paused for chat before LLM decision`
+            );
+            return; // Gracefully exit to allow chat handling
+          } else {
+            logger.info(
+              `🛑 Stopping before LLM decision - user no longer active`
+            );
+            return;
+          }
         }
 
+        // Get fresh conversation history for this page
+        const currentConversationHistory =
+          this.globalStore.getConversationHistory(pageData.urlHash);
+
+        // Get incomplete nodes context for actionables/backtrack tools
+        const incompleteNodes = this.globalStore.getActionsFromTree(
+          pageData.urlHash
+        );
+
         const decision = await this.llmClient.decideNextAction(
+          this.langfuseTraceId,
           currentScreenshotBuffer,
           pageData.url,
           this.session.metadata.objective,
           pageData.urlHash,
           this.session.globalStepCounter,
-          conversationHistory,
+          currentConversationHistory,
           this.session.pageQueue,
           this.session.pages,
           this.isExplorationObjective,
           maxPagesReached,
           this.session.userInputs,
           this.session.flowContext,
-          this.session.actionHistory
+          this.session.actionHistory,
+          incompleteNodes
         );
 
-        // Check if user is still active after LLM call
-        if (!this.isUserStillActive()) {
-          logger.info(`🛑 Stopping after LLM decision - user no longer active`);
-          return;
+        // Check if exploration should continue after LLM call
+        if (!this.shouldContinueExploration()) {
+          if (this.isInterrupted) {
+            logger.info(
+              `⏸️ Page processing paused for chat after LLM decision`
+            );
+            return; // Gracefully exit to allow chat handling
+          } else {
+            logger.info(
+              `🛑 Stopping after LLM decision - user no longer active`
+            );
+            return;
+          }
         }
 
         if (!decision) {
           logger.warn("❌ Failed to get LLM decision, moving to next page");
+          break;
+        }
+
+        if (
+          this.session.flowContext.isInSensitiveFlow &&
+          !decision.isInSensitiveFlow
+        ) {
+          this.session.flowContext.isInSensitiveFlow = false;
+          const newUrl = this.normalizeUrl(this.page.url());
+          logger.info(`🚫 Sensitive flow ended, redirecting to ${newUrl}`);
+          await this.addUrlToQueue(newUrl, 1);
           break;
         }
 
@@ -391,7 +416,7 @@ export class WebExplorer {
                 tool: decision.tool_to_use,
                 instruction: decision.tool_parameters.instruction,
                 reasoning: decision.reasoning,
-                nextPlan: decision.next_plan,
+                nextPlan: "",
                 isPageCompleted: decision.isCurrentPageExecutionCompleted,
               },
               maxPagesReached,
@@ -399,10 +424,12 @@ export class WebExplorer {
           });
         }
 
-        conversationHistory.push({
-          role: "assistant",
-          content: JSON.stringify(decision),
-        });
+        // Add decision to page-level conversation history
+        this.globalStore.addConversationMessage(
+          pageData.urlHash,
+          "assistant",
+          JSON.stringify(decision)
+        );
 
         // Add to session-level decision history
         const decisionEntry = {
@@ -419,7 +446,6 @@ export class WebExplorer {
         logger.info(`🤖 LLM Decision: ${decision.tool_to_use}`, {
           reasoning: decision.reasoning,
           instruction: decision.tool_parameters.instruction,
-          nextPlan: decision.next_plan,
           isCurrentPageExecutionCompleted:
             decision.isCurrentPageExecutionCompleted,
         });
@@ -462,6 +488,195 @@ export class WebExplorer {
             pageData,
             currentScreenshotBuffer
           );
+        } else if (decision.tool_to_use === "actionables") {
+          // Get current page's global store tree and add actionables as children
+          const currentNode = this.globalStore.getCurrentTreeNode(
+            pageData.urlHash
+          );
+          if (currentNode && decision.tool_parameters.actionables) {
+            const actionables = decision.tool_parameters.actionables;
+
+            // Add each actionable as a child node
+            for (const actionable of actionables) {
+              const childId = `${currentNode.id}_actionable_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+              const childNode: TreeNode = {
+                id: childId,
+                completed: false,
+                action: actionable.instruction || `Action: ${actionable.text}`,
+                actionType: actionable.actionType, // Use the actionType from the actionable
+                children: [],
+              };
+
+              currentNode.children.push(childNode);
+            }
+
+            // Save the updated tree structure
+            this.globalStore.saveTreeState(pageData.urlHash);
+
+            logger.info(
+              `📝 Added ${actionables.length} actionables as children to current node`
+            );
+
+            // Move current node to first actionable child and execute its action
+            if (currentNode.children.length > 0) {
+              const firstChild = currentNode.children[0];
+
+              // Update current node to the first child
+              this.globalStore.setCurrentTreeNode(
+                pageData.urlHash,
+                firstChild.id
+              );
+
+              logger.info(
+                `🎯 Moving to first actionable child: ${firstChild.id}`
+              );
+              logger.info(`🎬 Executing action: ${firstChild.action}`);
+
+              // Execute page_act with the first child's action
+              stepResult = await this.executeTool(
+                "page_act",
+                firstChild.action,
+                pageData,
+                currentScreenshotBuffer
+              );
+
+              // Check if page changed after action execution
+              if (stepResult && stepResult.urlChanged) {
+                logger.info(
+                  `🔄 Page change detected, marking current node as completed`
+                );
+
+                // Mark current node as completed
+                this.globalStore.markNodeCompleted(
+                  pageData.urlHash,
+                  firstChild.id
+                );
+
+                // Find next incomplete node using DFS
+                const nextIncompleteNode =
+                  this.globalStore.getNextIncompleteNode(pageData.urlHash);
+
+                if (nextIncompleteNode) {
+                  logger.info(
+                    `🎯 Moving to next incomplete node: ${nextIncompleteNode.id}`
+                  );
+
+                  // Update current node to the next incomplete node
+                  this.globalStore.setCurrentTreeNode(
+                    pageData.urlHash,
+                    nextIncompleteNode.id
+                  );
+
+                  // Reset page state and execute the path to current node
+                  const resetResult = await this.resetPageState(
+                    pageData,
+                    nextIncompleteNode.id
+                  );
+
+                  if (resetResult) {
+                    // Update stepResult to reflect the reset action with only the incomplete state instruction
+                    stepResult = {
+                      ...resetResult,
+                      instruction: nextIncompleteNode.action, // Only the incomplete state action
+                      result: "Action success", // For resetting scenario
+                    };
+                  }
+                } else {
+                  logger.info(`✅ All actionables completed for this page`);
+
+                  // Update stepResult for page change completion
+                  stepResult = {
+                    ...stepResult,
+                    result:
+                      "Page change detected, now system will handle it separately",
+                  };
+                }
+              }
+            }
+          }
+        } else if (decision.tool_to_use === "backtrack") {
+          // Handle backtrack: mark current node as completed and move to next incomplete node
+          const currentNodeId = this.globalStore.getCurrentTreeNodeId(
+            pageData.urlHash
+          );
+
+          if (currentNodeId) {
+            logger.info(
+              `⬅️ Backtrack requested, marking current node as completed: ${currentNodeId}`
+            );
+
+            // Mark current node as completed
+            this.globalStore.markNodeCompleted(pageData.urlHash, currentNodeId);
+
+            // Find next incomplete node using DFS
+            const nextIncompleteNode = this.globalStore.getNextIncompleteNode(
+              pageData.urlHash
+            );
+
+            if (nextIncompleteNode) {
+              logger.info(
+                `🎯 Moving to next incomplete node: ${nextIncompleteNode.id}`
+              );
+
+              // Update current node to the next incomplete node
+              this.globalStore.setCurrentTreeNode(
+                pageData.urlHash,
+                nextIncompleteNode.id
+              );
+
+              // Reset page state and execute the path to current node (backtrack context)
+              const resetResult = await this.resetPageState(
+                pageData,
+                nextIncompleteNode.id,
+                true
+              );
+
+              if (resetResult) {
+                // Update stepResult to reflect the reset action with only the incomplete state instruction
+                stepResult = {
+                  ...resetResult,
+                  instruction: nextIncompleteNode.action, // Only the incomplete state action
+                  result: "Action success", // For resetting scenario
+                };
+              } else {
+                // Fallback if reset failed
+                stepResult = {
+                  step: this.session.globalStepCounter,
+                  timestamp: new Date().toISOString(),
+                  tool_used: "backtrack",
+                  instruction: nextIncompleteNode.action,
+                  success: false,
+                  result: "Reset failed during backtrack",
+                };
+              }
+            } else {
+              logger.info(
+                `✅ All actionables completed for this page - backtrack complete`
+              );
+
+              // Create a simple successful result for backtrack completion
+              stepResult = {
+                step: this.session.globalStepCounter,
+                timestamp: new Date().toISOString(),
+                tool_used: "backtrack",
+                instruction: decision.tool_parameters.instruction,
+                success: true,
+                result: "Backtrack completed - all actionables finished",
+              };
+            }
+          } else {
+            logger.warn(`⚠️ No current node found for backtrack operation`);
+
+            // Create a failed result
+            stepResult = {
+              step: this.session.globalStepCounter,
+              timestamp: new Date().toISOString(),
+              tool_used: "backtrack",
+              instruction: decision.tool_parameters.instruction,
+              success: false,
+              result: "Backtrack failed - no current node found",
+            };
+          }
         } else {
           stepResult = await this.executeTool(
             decision.tool_to_use,
@@ -485,10 +700,43 @@ export class WebExplorer {
           stepsOnThisPage++;
         }
 
-        // Check if tool execution was stopped due to user being inactive
+        // Check if tool execution was stopped due to user being inactive or chat interruption
         if (stepResult === null) {
           logger.info(`🛑 Tool execution stopped - user no longer active`);
           return;
+        }
+
+        if (
+          stepResult.result &&
+          stepResult.result.includes("skipped") &&
+          decision.tool_to_use === "user_input"
+        ) {
+          this.globalStore.addConversationMessage(
+            pageData.urlHash,
+            "user",
+            "User skipped the input prompt, so skip this step and do something else."
+          );
+        } else {
+          this.globalStore.addConversationMessage(
+            pageData.urlHash,
+            "user",
+            `Tool result: ${JSON.stringify(stepResult)}`
+          );
+        }
+
+        // Check if exploration should continue after tool execution
+        if (!this.shouldContinueExploration()) {
+          if (this.isInterrupted) {
+            logger.info(
+              `⏸️ Page processing paused for chat after tool execution`
+            );
+            return; // Gracefully exit to allow chat handling
+          } else {
+            logger.info(
+              `🛑 Stopping after tool execution - user no longer active`
+            );
+            return;
+          }
         }
 
         // Emit tool execution completed event
@@ -511,11 +759,6 @@ export class WebExplorer {
             },
           });
         }
-
-        conversationHistory.push({
-          role: "user",
-          content: `Tool result: ${JSON.stringify(stepResult)}`,
-        });
 
         if (!stepResult) {
           logger.warn("❌ Tool execution failed, continuing...");
@@ -575,7 +818,6 @@ export class WebExplorer {
           logger.info("✅ LLM indicated current page execution is completed", {
             reason: "LLM set isCurrentPageExecutionCompleted to true",
             lastAction: decision.tool_parameters.instruction,
-            nextPlan: decision.next_plan,
           });
           this.saveSession();
           break;
@@ -607,6 +849,19 @@ export class WebExplorer {
       // Mark page as completed
       pageData.status = "completed";
       this.fileManager.savePageData(pageData.urlHash, pageData);
+
+      // Generate final graph after page completion (with await)
+      try {
+        logger.info(
+          `📊 Generating final graph for completed page: ${pageData.url}`
+        );
+        await this.startGraphGenerationFlow(pageData.urlHash);
+        logger.info(`✅ Final graph generation completed for: ${pageData.url}`);
+      } catch (error) {
+        logger.error(`❌ Final graph generation failed for: ${pageData.url}`, {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
 
       // Emit page completed event
       if (this.socket && this.userName) {
@@ -663,7 +918,8 @@ export class WebExplorer {
    * Returns { newUrl: string | null, actionResult: any }
    */
   private async executeActionAndCheckUrlChange(
-    instruction: string
+    instruction: string,
+    urlHash: string
   ): Promise<{ newUrl: string | null; actionResult: any }> {
     // Store the current URL before executing action
     const originalUrl = this.normalizeUrl(this.page.url());
@@ -693,11 +949,21 @@ export class WebExplorer {
     const newUrl = this.normalizeUrl(this.page.url());
     const urlChanged = newUrl !== originalUrl;
 
+    const afterActionScreenshot = await this.page.screenshot({
+      fullPage: false,
+    });
+
     if (urlChanged) {
       logger.info(`🔄 URL changed: ${originalUrl} → ${newUrl}`);
 
       // Check if we're in a sensitive flow (login, signup, etc.)
       if (this.session.flowContext.isInSensitiveFlow) {
+        this.globalStore.addAction(
+          urlHash,
+          `${instruction}. In this step, the user has navigated to a new page, but currently in a sensitive flow, so the user will stay on the new page and continue with the flow.`,
+          `data:image/png;base64,${afterActionScreenshot.toString("base64")}`,
+          this.session.globalStepCounter
+        );
         // In sensitive flow - stay on new page, don't navigate back
         logger.info(
           `🔒 Sensitive flow detected - staying on new URL: ${newUrl}`
@@ -705,6 +971,12 @@ export class WebExplorer {
 
         return { newUrl: null, actionResult: actResult };
       } else {
+        this.globalStore.addAction(
+          urlHash,
+          `${instruction}. In this step, the user has navigated to a new page, which will be queued and processed seperately.`,
+          `data:image/png;base64,${afterActionScreenshot.toString("base64")}`,
+          this.session.globalStepCounter
+        );
         // Normal flow - navigate back to original URL for continued processing
         logger.info(`🔙 Navigating back to original URL: ${originalUrl}`);
         await this.page.goto(originalUrl, {
@@ -717,6 +989,12 @@ export class WebExplorer {
         return { newUrl: newUrl, actionResult: actResult };
       }
     } else {
+      this.globalStore.addAction(
+        urlHash,
+        instruction,
+        `data:image/png;base64,${afterActionScreenshot.toString("base64")}`,
+        this.session.globalStepCounter
+      );
       // URL didn't change, don't reload, just return the result
       logger.debug(`✅ URL remained the same: ${originalUrl}`);
       return { newUrl: null, actionResult: actResult };
@@ -745,7 +1023,9 @@ export class WebExplorer {
 
         // Customize the system prompt
         instructions: `You are a helpful assistant that can use a web browser.
-    Do not ask follow up questions, the user will trust your judgement.`,
+	Do not ask follow up questions, the user will trust your judgement. Also only do that action what user have asked, don't do anything else, if user asked to click a button, then only click that button and complete it immediately, dont click or do anything else. JUST FOLLOW THE INSTRUCTIONS.
+  If the user asks to hover and hover fails, then try clicking that button. Only for hover instructions, if hover fails, then try clicking that button.
+  `,
 
         // Customize the API key
         options: {
@@ -786,96 +1066,6 @@ export class WebExplorer {
     }
   }
 
-  private async toolPageExtract(instruction: string): Promise<any> {
-    console.log(`🔍 Extracting: ${instruction}`);
-    try {
-      // Enhanced schema for more comprehensive analysis
-      const extractSchema = z.object({
-        extracted_data: z
-          .string()
-          .describe(
-            "Comprehensive analysis of the page content, features, and functionality. Focus on business value, user experience patterns, technical capabilities, and strategic insights rather than just listing visible elements. Analyze what you see in context of the overall platform strategy."
-          ),
-        elements_found: z
-          .array(z.string())
-          .describe(
-            "Key functional elements and features that indicate platform capabilities and user experience design"
-          ),
-        page_structure: z
-          .string()
-          .describe(
-            "Analysis of page architecture, information hierarchy, and UX design patterns used"
-          ),
-        interactive_elements: z
-          .array(z.string())
-          .describe(
-            "Interactive features and their strategic purpose in the user journey and conversion funnel"
-          ),
-        business_insights: z
-          .string()
-          .describe(
-            "Business model indicators, monetization clues, competitive positioning signals, and strategic market approach evident on this page"
-          ),
-        technical_observations: z
-          .string()
-          .describe(
-            "Technical architecture insights, scalability indicators, integration capabilities, and platform sophistication level"
-          ),
-      });
-
-      // Enhanced instruction to get better analytical data
-      const enhancedInstruction = `${instruction}
-
-ANALYSIS APPROACH: Act as a senior product manager analyzing this platform. Focus on:
-1. Business strategy and value proposition signals
-2. User experience design patterns and conversion optimization
-3. Technical architecture and capability indicators  
-4. Competitive positioning and market approach
-5. Revenue model and monetization strategy clues
-6. Growth and user acquisition tactics
-
-Provide comprehensive insights rather than just listing visible elements. Analyze WHY features exist and HOW they contribute to the platform's business objectives.`;
-
-      console.log(
-        `🔧 Calling stagehand.page.extract with enhanced instruction`
-      );
-
-      const result = await this.stagehand.page.extract({
-        instruction: enhancedInstruction,
-        schema: extractSchema,
-      });
-
-      console.log(`✅ Extract succeeded:`, result);
-      return { success: true, data: result };
-    } catch (error) {
-      console.error(`❌ Extract failed with error:`, error);
-      console.error(`❌ Error type:`, typeof error);
-      console.error(
-        `❌ Error message:`,
-        error instanceof Error ? error.message : String(error)
-      );
-      console.error(
-        `❌ Error stack:`,
-        error instanceof Error ? error.stack : "No stack trace"
-      );
-
-      // Fallback to simple string extraction
-      try {
-        const fallbackResult = await this.stagehand.page.extract({
-          instruction,
-          schema: z.object({ data: z.string() }),
-        });
-        return { success: true, data: fallbackResult };
-      } catch (fallbackError) {
-        return {
-          error: `Extraction failed: ${
-            error instanceof Error ? error.message : String(error)
-          }`,
-        };
-      }
-    }
-  }
-
   /**
    * Request user input via Socket.IO and wait for response - supports multiple inputs
    */
@@ -894,6 +1084,7 @@ Provide comprehensive insights rather than just listing visible elements. Analyz
   ): Promise<{
     success: boolean;
     inputs?: { [key: string]: string };
+    isSkipped?: boolean;
     error?: string;
   }> {
     if (!this.socket || !this.userName) {
@@ -946,21 +1137,51 @@ Provide comprehensive insights rather than just listing visible elements. Analyz
 
         // Set up listener for multiple input responses
         const inputResponseHandler = (data: {
-          inputs: { [key: string]: string };
+          inputs?: { [key: string]: string };
+          isSkipped?: boolean;
         }) => {
-          logger.info(`📥 Received user_input_response from frontend`, {
-            userName: this.userName,
-            inputKeys: Object.keys(data.inputs).join(", "),
-            inputCount: Object.keys(data.inputs).length,
-          });
+          if (data.isSkipped) {
+            logger.info(`⏭️ User input skipped from frontend`, {
+              userName: this.userName,
+              skipRequested: true,
+            });
 
-          clearTimeout(timeout);
-          this.socket!.off("user_input_response", inputResponseHandler);
+            clearTimeout(timeout);
+            this.socket!.off("user_input_response", inputResponseHandler);
 
-          resolve({
-            success: true,
-            inputs: data.inputs,
-          });
+            resolve({
+              success: true,
+              isSkipped: true,
+            });
+          } else if (data.inputs) {
+            logger.info(`📥 Received user_input_response from frontend`, {
+              userName: this.userName,
+              inputKeys: Object.keys(data.inputs).join(", "),
+              inputCount: Object.keys(data.inputs).length,
+            });
+
+            clearTimeout(timeout);
+            this.socket!.off("user_input_response", inputResponseHandler);
+
+            resolve({
+              success: true,
+              inputs: data.inputs,
+            });
+          } else {
+            logger.error(`❌ Invalid user_input_response from frontend`, {
+              userName: this.userName,
+              data,
+            });
+
+            clearTimeout(timeout);
+            this.socket!.off("user_input_response", inputResponseHandler);
+
+            resolve({
+              success: false,
+              error:
+                "Invalid user input response: no inputs or skip signal provided",
+            });
+          }
         };
 
         // Listen for user input response
@@ -1029,6 +1250,7 @@ Provide comprehensive insights rather than just listing visible elements. Analyz
       let inputResult: {
         success: boolean;
         inputs?: { [key: string]: string };
+        isSkipped?: boolean;
         error?: string;
       };
 
@@ -1070,7 +1292,31 @@ Provide comprehensive insights rather than just listing visible elements. Analyz
 
       logger.info("inputResult check", inputResult);
 
-      if (inputResult.success && inputResult.inputs) {
+      if (inputResult.success && inputResult.isSkipped) {
+        // Handle skip case - mark as successful and continue normal flow
+        step.success = true;
+        step.result = "User input skipped - continuing with normal flow";
+
+        // Emit user input received event
+        if (this.socket && this.userName) {
+          this.socket.emit("exploration_update", {
+            type: "user_input_received",
+            timestamp: new Date().toISOString(),
+            data: {
+              userName: this.userName,
+              url: pageData.url,
+              urlHash: pageData.urlHash,
+              stepNumber: this.session.globalStepCounter,
+              inputKeys: [],
+              inputValues: {},
+              inputReceived: false,
+              isSkipped: true,
+            },
+          });
+        }
+
+        logger.info(`⏭️ user_input skipped - continuing normal flow`);
+      } else if (inputResult.success && inputResult.inputs) {
         step.success = true;
 
         const inputKeys = Object.keys(inputResult.inputs);
@@ -1176,7 +1422,7 @@ Provide comprehensive insights rather than just listing visible elements. Analyz
    * Execute the chosen tool
    */
   private async executeTool(
-    toolName: "page_act" | "page_extract" | "user_input" | "standby",
+    toolName: "page_act" | "user_input" | "standby" | "backtrack",
     instruction: string,
     pageData: PageData,
     screenshotBuffer: Buffer,
@@ -1209,158 +1455,11 @@ Provide comprehensive insights rather than just listing visible elements. Analyz
 
     try {
       switch (toolName) {
-        case "page_extract":
-          const extractResult = await this.toolPageExtract(instruction);
-
-          // Check if user is still active after tool execution
-          if (!this.isUserStillActive()) {
-            logger.info(
-              `🛑 Stopping after page_extract - user no longer active`
-            );
-            return null;
-          }
-
-          if (extractResult.success) {
-            step.success = true;
-            step.result = JSON.stringify(extractResult.data);
-
-            // 🆕 NEW COMPREHENSIVE EXTRACTION FORMATTING FLOW
-
-            // 1. Increment version number
-            pageData.currentExtractionVersion++;
-            const currentVersion = pageData.currentExtractionVersion;
-
-            // 2. Collect all screenshots from current page for LLM context
-            const screenshotBuffers = pageData.screenshots
-              .map((s) => s.buffer!)
-              .filter(Boolean);
-
-            // 3. Collect previous extraction data from current page only
-            const previousExtractions = pageData.extractionResults.map(
-              (r) => r.rawData
-            );
-            const previousMarkdowns = pageData.extractionResults.map(
-              (r) => r.formattedMarkdown
-            );
-
-            logger.info(`🔄 Processing extraction v${currentVersion}`, {
-              previousVersions: previousExtractions.length,
-              screenshotsAvailable: screenshotBuffers.length,
-              currentInstruction: instruction,
-            });
-
-            // Check if user is still active before comprehensive LLM call
-            if (!this.isUserStillActive()) {
-              logger.info(
-                `🛑 Stopping before comprehensive formatting - user no longer active`
-              );
-              return null;
-            }
-
-            // 4. 🆕 NEW LLM CALL: Comprehensive formatting with all context
-            const formattedMarkdown =
-              await this.llmClient.formatExtractionResults(
-                screenshotBuffers,
-                pageData.url,
-                this.session.metadata.objective,
-                pageData.urlHash,
-                this.session.globalStepCounter,
-                previousExtractions,
-                previousMarkdowns,
-                extractResult.data // Current extraction data
-              );
-
-            // Check if user is still active after formatting call
-            if (!this.isUserStillActive()) {
-              logger.info(
-                `🛑 Stopping after formatting - user no longer active`
-              );
-              return null;
-            }
-
-            // 5. Store versioned extraction result
-            const extractionResult: ExtractionResult = {
-              version: currentVersion,
-              timestamp: new Date().toISOString(),
-              rawData: extractResult.data,
-              formattedMarkdown:
-                formattedMarkdown ||
-                `# Extraction v${currentVersion}\n\n${JSON.stringify(extractResult.data, null, 2)}`,
-              stepNumber: this.session.globalStepCounter,
-            };
-
-            pageData.extractionResults.push(extractionResult);
-
-            // 6. Check objective completion using original method
-            if (!this.isExplorationObjective) {
-              const analysisResult = await this.llmClient.executePageExtract(
-                screenshotBuffer,
-                pageData.url,
-                instruction,
-                this.session.metadata.objective,
-                pageData.urlHash,
-                this.session.globalStepCounter,
-                extractResult
-              );
-
-              if (analysisResult) {
-                step.objectiveAchieved = analysisResult.objectiveAchieved;
-              }
-            }
-
-            // Check if user is still active after objective check
-            if (!this.isUserStillActive()) {
-              logger.info(
-                `🛑 Stopping after objective check - user no longer active`
-              );
-              return null;
-            }
-
-            // 7. Emit enhanced socket event with versioned data
-            if (this.socket && this.userName) {
-              this.socket.emit("exploration_update", {
-                type: "page_extract_result",
-                timestamp: new Date().toISOString(),
-                data: {
-                  userName: this.userName,
-                  url: pageData.url,
-                  urlHash: pageData.urlHash,
-                  stepNumber: this.session.globalStepCounter,
-                  instruction,
-                  // Latest formatted result for frontend
-                  extractedData: formattedMarkdown,
-                  // Version information
-                  version: currentVersion,
-                  totalVersions: pageData.extractionResults.length,
-                  isNewVersion: true, // 🆕 Notify frontend of changes
-                  // Legacy fields for compatibility
-                  elementsFound: extractResult.data?.elements_found || [],
-                  pageStructure: extractResult.data?.page_structure,
-                  interactiveElements:
-                    extractResult.data?.interactive_elements || [],
-                },
-              });
-            }
-
-            logger.info(
-              `📊 Enhanced page_extract completed v${currentVersion}`,
-              {
-                dataExtracted: true,
-                elementsFound: extractResult.data?.elements_found?.length || 0,
-                formattedLength: formattedMarkdown?.length || 0,
-                totalVersions: pageData.extractionResults.length,
-                screenshotsUsed: screenshotBuffers.length,
-              }
-            );
-          } else {
-            step.success = false;
-            step.result = extractResult.error;
-          }
-          break;
-
         case "page_act":
-          const actionResult =
-            await this.executeActionAndCheckUrlChange(instruction);
+          const actionResult = await this.executeActionAndCheckUrlChange(
+            instruction,
+            pageData.urlHash
+          );
 
           // Check if user is still active after tool execution
           if (!this.isUserStillActive()) {
@@ -1418,6 +1517,20 @@ Provide comprehensive insights rather than just listing visible elements. Analyz
             step.urlChanged = urlChangedFlag;
             step.success = toolResult.success;
             step.result = `PREVIOUS_ACTION_RESULT: URL_CHANGED=false, STAYED_ON_SAME_PAGE=true, ACTION_RESULT=${toolResult.success ? "SUCCESS" : "FAILED"}`;
+          }
+
+          // Check if graph generation is already in progress
+          if (!this.globalStore.isGraphGenerationInProgress(pageData.urlHash)) {
+            this.startGraphGenerationFlow(pageData.urlHash).catch((error) => {
+              logger.error("❌ Background graph generation failed", {
+                error,
+                urlHash: pageData.urlHash,
+              });
+            });
+          } else {
+            logger.info("⏳ Graph generation already in progress, skipping", {
+              urlHash: pageData.urlHash,
+            });
           }
 
           // Emit specific page_act event
@@ -1638,20 +1751,6 @@ Provide comprehensive insights rather than just listing visible elements. Analyz
       return;
     }
 
-    // Track page linkage for frontend diagram
-    if (sourceUrl) {
-      const sourceUrlHash = FileManager.generateUrlHash(sourceUrl);
-      if (!this.pageLinkages.has(sourceUrlHash)) {
-        this.pageLinkages.set(sourceUrlHash, []);
-      }
-      this.pageLinkages.get(sourceUrlHash)!.push(url);
-
-      logger.info("🔗 Page linkage recorded", {
-        from: sourceUrl,
-        to: url,
-      });
-    }
-
     // Create page data
     const pageData: PageData = {
       url,
@@ -1713,46 +1812,6 @@ Provide comprehensive insights rather than just listing visible elements. Analyz
   }
 
   /**
-   * Save page linkages for frontend diagram
-   */
-  private savePageLinkages(): void {
-    // Convert Map to a serializable object for frontend consumption
-    const linkagesObject = Object.fromEntries(
-      Array.from(this.pageLinkages.entries()).map(([source, targets]) => [
-        source,
-        targets,
-      ])
-    );
-
-    // Create the linkages data structure
-    const linkagesData = {
-      sessionId: this.session.metadata.sessionId,
-      timestamp: new Date().toISOString(),
-      totalSources: this.pageLinkages.size,
-      totalLinkages: Array.from(this.pageLinkages.values()).reduce(
-        (sum, targets) => sum + targets.length,
-        0
-      ),
-      linkages: linkagesObject,
-    };
-
-    // Save to file system using FileManager pattern
-    const linkagesPath = path.join(
-      this.fileManager["sessionDir"],
-      "page-linkages.json"
-    );
-    fs.writeFileSync(linkagesPath, JSON.stringify(linkagesData, null, 2));
-
-    logger.info("💾 Page linkages saved", {
-      totalSources: this.pageLinkages.size,
-      totalLinkages: Array.from(this.pageLinkages.values()).reduce(
-        (sum, targets) => sum + targets.length,
-        0
-      ),
-    });
-  }
-
-  /**
    * Finalize exploration session
    */
   protected async finalizeSession(
@@ -1771,9 +1830,6 @@ Provide comprehensive insights rather than just listing visible elements. Analyz
       this.sessionDecisionHistory
     );
 
-    // Save page linkages for frontend diagram
-    this.savePageLinkages();
-
     this.saveSession();
 
     // Emit session completion with linkages
@@ -1786,7 +1842,6 @@ Provide comprehensive insights rather than just listing visible elements. Analyz
           objectiveAchieved,
           totalPages: this.session.metadata.totalPagesDiscovered,
           totalActions: this.session.metadata.totalActionsExecuted,
-          pageLinkages: Object.fromEntries(this.pageLinkages.entries()),
           sessionId: this.session.metadata.sessionId,
           duration: `${duration}ms`,
         },
@@ -1802,7 +1857,61 @@ Provide comprehensive insights rather than just listing visible elements. Analyz
       duration: `${duration}ms`,
     });
 
+    await this.langfuse.flushAsync();
+
     return objectiveAchieved;
+  }
+
+  /**
+   * Start non-blocking graph generation flow
+   */
+  private async startGraphGenerationFlow(urlHash: string): Promise<void> {
+    try {
+      // Set flag to indicate graph generation is in progress
+      this.globalStore.setGraphGenerationInProgress(urlHash, true);
+
+      // Step 1: Emit "updating graph" event
+      this.globalStore.emitGraphUpdating(urlHash);
+
+      // Step 2: Get page store data
+      const pageStore = this.globalStore.getPageStore(urlHash);
+      if (!pageStore) {
+        logger.warn(`⚠️ Page store not found for graph generation: ${urlHash}`);
+        return;
+      }
+
+      // Always update graph after page_act
+      const currentGraph = pageStore.graph;
+
+      // Generate new graph with unified method
+      logger.info(`📊 Generating interaction graph for: ${pageStore.url}`);
+      const newGraph = await this.llmClient.generateInteractionGraph(
+        this.langfuseTraceId,
+        pageStore,
+        currentGraph,
+        this.globalStore
+      );
+
+      if (newGraph) {
+        // Step 5: Update GlobalStore with new graph
+        this.globalStore.updateGraph(urlHash, newGraph);
+
+        logger.info(`✅ Graph generation completed for: ${pageStore.url}`, {
+          nodes: newGraph.nodes.length,
+          edges: newGraph.edges.length,
+        });
+      } else {
+        logger.warn(`❌ Graph generation failed for: ${pageStore.url}`);
+      }
+    } catch (error: unknown) {
+      logger.error("❌ Graph generation flow failed", {
+        error: error instanceof Error ? error.message : String(error),
+        urlHash,
+      });
+    } finally {
+      // Always reset the flag, even if an error occurred
+      this.globalStore.setGraphGenerationInProgress(urlHash, false);
+    }
   }
 
   /**
@@ -1820,5 +1929,387 @@ Provide comprehensive insights rather than just listing visible elements. Analyz
       );
     }
     return isActive;
+  }
+
+  /**
+   * Handle user chat message (interrupts exploration)
+   */
+  async handleChatMessage(userMessage: string): Promise<void> {
+    try {
+      logger.info(`🗨️ Chat message received, interrupting exploration`, {
+        userMessage,
+      });
+
+      // Create checkpoint before interrupting
+      this.createExplorationCheckpoint();
+
+      // Mark as interrupted to pause exploration
+      this.isInterrupted = true;
+
+      // Get chat decision from ChatAgent
+      const chatDecision = await this.chatAgent.handleChatMessage(
+        userMessage,
+        this.explorationCheckpoint!
+      );
+
+      console.log("Chat decision:", chatDecision);
+
+      logger.info(`🤖 Chat decision: ${chatDecision.requestType}`, {
+        targetUrl: chatDecision.targetUrl,
+        needsUserInput: chatDecision.needsUserInput,
+      });
+
+      // Handle the chat decision
+      await this.executeChatDecision(chatDecision);
+    } catch (error) {
+      console.log("Error in handleChatMessage:", error);
+      logger.error("❌ Chat message handling failed", { error });
+
+      // Send error response to user
+      if (this.socket && this.userName) {
+        this.socket.emit("exploration_update", {
+          type: "chat_error",
+          timestamp: new Date().toISOString(),
+          data: {
+            userName: this.userName,
+            error: "Failed to process your message. Please try again.",
+          },
+        });
+      }
+    }
+  }
+
+  /**
+   * Execute chat decision based on type
+   */
+  private async executeChatDecision(decision: ChatDecision): Promise<void> {
+    switch (decision.requestType) {
+      case "task_specific":
+        await this.handleTaskSpecificRequest(decision);
+        break;
+
+      case "exploration":
+        await this.handleExplorationRequest(decision);
+        break;
+
+      case "question":
+        await this.handleQuestionRequest(decision);
+        break;
+    }
+  }
+
+  /**
+   * Handle task-specific chat requests
+   */
+  private async handleTaskSpecificRequest(
+    decision: ChatDecision
+  ): Promise<void> {
+    try {
+      if (decision.targetUrl) {
+        // Navigate to target page
+        const navigationSuccess = await this.chatAgent.navigateToPage(
+          decision.targetUrl
+        );
+
+        if (navigationSuccess) {
+          const urlHash = FileManager.generateUrlHash(decision.targetUrl);
+
+          // Get page conversation history for context
+          const pageHistory =
+            this.chatAgent.getPageConversationHistory(urlHash);
+
+          // If it's a new page discovered during task, register it but stop exploration
+          if (!this.session.pages.has(urlHash)) {
+            logger.info(
+              `📄 New page discovered during task: ${decision.targetUrl}`
+            );
+            await this.addUrlToQueue(decision.targetUrl, 1);
+            // Don't add to regular exploration queue - it's task-specific
+          }
+
+          logger.info(`✅ Task-specific navigation completed`, {
+            url: decision.targetUrl,
+            hasPageHistory: pageHistory.length > 0,
+          });
+        }
+      }
+
+      // Continue with task execution...
+      // Note: This is where specific task logic would be implemented
+      // For now, we'll resume exploration after chat completion
+      await this.resumeExplorationAfterChat();
+    } catch (error) {
+      logger.error("❌ Task-specific request failed", { error });
+      await this.resumeExplorationAfterChat();
+    }
+  }
+
+  /**
+   * Handle exploration requests
+   */
+  private async handleExplorationRequest(
+    decision: ChatDecision
+  ): Promise<void> {
+    try {
+      if (decision.targetUrl) {
+        // Navigate to target page
+        const navigationSuccess = await this.chatAgent.navigateToPage(
+          decision.targetUrl
+        );
+
+        if (navigationSuccess) {
+          const urlHash = FileManager.generateUrlHash(decision.targetUrl);
+
+          // Add to exploration queue with normal flow
+          if (!this.session.pages.has(urlHash)) {
+            await this.addUrlToQueue(decision.targetUrl, 1);
+          }
+
+          // Continue exploration on this page
+          const pageData = this.session.pages.get(urlHash);
+          if (pageData) {
+            await this.processPage(pageData);
+          }
+
+          // await this.langfuse.flushAsync();
+        }
+      }
+
+      // Resume normal exploration
+      await this.resumeExplorationAfterChat();
+    } catch (error) {
+      logger.error("❌ Exploration request failed", { error });
+      await this.resumeExplorationAfterChat();
+    }
+  }
+
+  /**
+   * Handle question requests (no navigation needed)
+   */
+  private async handleQuestionRequest(decision: ChatDecision): Promise<void> {
+    // Question responses are already handled in ChatAgent
+    // Just resume exploration
+    await this.resumeExplorationAfterChat();
+  }
+
+  /**
+   * Create exploration checkpoint
+   */
+  private createExplorationCheckpoint(): void {
+    const currentUrl = this.page.url();
+    const currentPageHash = FileManager.generateUrlHash(currentUrl);
+
+    this.explorationCheckpoint = {
+      timestamp: new Date().toISOString(),
+      currentPageUrl: currentUrl,
+      currentPageHash: currentPageHash,
+      queuePosition: this.session.pageQueue.length,
+      remainingQueue: [...this.session.pageQueue],
+      explorationPhase:
+        this.session.pageQueue.length > 0 ? "active" : "completed",
+      lastStepNumber: this.session.globalStepCounter,
+    };
+
+    logger.info(`📍 Exploration checkpoint created`, {
+      currentUrl,
+      queueRemaining: this.session.pageQueue.length,
+      lastStep: this.session.globalStepCounter,
+    });
+
+    // Save checkpoint to file system
+    this.saveCheckpoint();
+  }
+
+  /**
+   * Resume exploration after chat completion
+   */
+  private async resumeExplorationAfterChat(): Promise<void> {
+    try {
+      logger.info(`🔄 Resuming exploration after chat`, {
+        hadCheckpoint: !!this.explorationCheckpoint,
+        queueRemaining: this.session.pageQueue.length,
+      });
+
+      // Mark as no longer interrupted
+      this.isInterrupted = false;
+
+      // If exploration was completed before interruption, don't resume
+      if (
+        !this.explorationCheckpoint ||
+        this.explorationCheckpoint.explorationPhase === "completed"
+      ) {
+        logger.info(
+          `✅ Exploration was already completed, staying ready for more chat`
+        );
+        return;
+      }
+
+      // Restore queue state if needed
+      if (this.explorationCheckpoint.remainingQueue.length > 0) {
+        this.session.pageQueue = [...this.explorationCheckpoint.remainingQueue];
+      }
+
+      // Continue with remaining exploration
+      if (this.session.pageQueue.length > 0) {
+        logger.info(`🚀 Continuing exploration from checkpoint`, {
+          queueSize: this.session.pageQueue.length,
+        });
+
+        await this.exploreSequentially();
+      } else {
+        logger.info(`✅ No more pages to explore, ready for new chat messages`);
+      }
+    } catch (error) {
+      logger.error("❌ Failed to resume exploration", { error });
+    }
+  }
+
+  /**
+   * Save checkpoint to file system
+   */
+  private saveCheckpoint(): void {
+    if (!this.explorationCheckpoint) return;
+
+    try {
+      const checkpointPath = path.join(
+        this.fileManager["sessionDir"],
+        "exploration_checkpoint.json"
+      );
+      fs.writeFileSync(
+        checkpointPath,
+        JSON.stringify(this.explorationCheckpoint, null, 2)
+      );
+
+      logger.info(`💾 Exploration checkpoint saved`, {
+        path: checkpointPath,
+        timestamp: this.explorationCheckpoint.timestamp,
+      });
+    } catch (error) {
+      logger.error("❌ Failed to save checkpoint", { error });
+    }
+  }
+
+  /**
+   * Load checkpoint from file system
+   */
+  private loadCheckpoint(): void {
+    try {
+      const checkpointPath = path.join(
+        this.fileManager["sessionDir"],
+        "exploration_checkpoint.json"
+      );
+
+      if (fs.existsSync(checkpointPath)) {
+        const checkpointData = JSON.parse(
+          fs.readFileSync(checkpointPath, "utf8")
+        );
+        this.explorationCheckpoint = checkpointData;
+
+        logger.info(`📂 Exploration checkpoint loaded`, {
+          timestamp: this.explorationCheckpoint?.timestamp,
+          queueRemaining: this.explorationCheckpoint?.remainingQueue.length,
+        });
+      }
+    } catch (error) {
+      logger.warn(`⚠️ Could not load exploration checkpoint`, { error });
+    }
+  }
+
+  /**
+   * Check if exploration should continue (not interrupted)
+   */
+  private shouldContinueExploration(): boolean {
+    return !this.isInterrupted && this.isUserStillActive();
+  }
+
+  /**
+   * Reset page state by building a combined command from start to current node
+   * and executing it with page_act
+   */
+  private async resetPageState(
+    pageData: PageData,
+    targetNodeId: string,
+    isBacktrack: boolean = false
+  ) {
+    logger.info(`🔄 Resetting page state to reach node: ${targetNodeId}`);
+
+    try {
+      // Get the path from root to target node
+      const pathToTarget = this.globalStore.getPathToNode(
+        pageData.urlHash,
+        targetNodeId
+      );
+
+      if (pathToTarget.length === 0) {
+        logger.warn(`⚠️ No path found to target node: ${targetNodeId}`);
+        return null;
+      }
+
+      // Build combined command from all actions in the path (excluding root which has no action)
+      const actionCommands: string[] = [];
+      const completedActions: string[] = [];
+
+      for (const node of pathToTarget) {
+        if (node.action && node.action.trim() !== "") {
+          if (node.completed) {
+            completedActions.push(node.action);
+          }
+          actionCommands.push(node.action);
+        }
+      }
+
+      if (actionCommands.length === 0) {
+        logger.warn(
+          `⚠️ No actions found in path to target node: ${targetNodeId}`
+        );
+        return null;
+      }
+
+      // Create smarter instruction based on context
+      let combinedInstruction: string;
+
+      if (isBacktrack && completedActions.length > 0) {
+        // For backtracking: acknowledge current state and provide context
+        const targetAction = pathToTarget[pathToTarget.length - 1].action;
+        const contextActions = actionCommands.slice(0, -1).join(", then ");
+
+        combinedInstruction = `I am currently on a page where these actions have already been performed: [${completedActions.join(", ")}]. Now I need to continue the sequence by performing: ${contextActions}, then ${targetAction}. Please execute this complete sequence while being aware that some initial actions may have already taken effect on the current page state.`;
+      } else {
+        // For normal reset: simple combined instruction
+        combinedInstruction = actionCommands.join(", then ");
+      }
+
+      logger.info(
+        `🎬 Executing ${isBacktrack ? "backtrack-aware" : "combined"} reset command: ${combinedInstruction}`
+      );
+
+      // Take current screenshot for the reset action
+      const resetScreenshotBuffer = await this.page.screenshot({
+        fullPage: false,
+      });
+
+      // Execute the combined command using page_act
+      const resetResult = await this.executeTool(
+        "page_act",
+        combinedInstruction,
+        pageData,
+        resetScreenshotBuffer
+      );
+
+      if (resetResult && resetResult.success) {
+        logger.info(`✅ Page state reset successful`);
+      } else {
+        logger.warn(`⚠️ Page state reset may have failed`);
+      }
+
+      return resetResult;
+    } catch (error) {
+      logger.error(`❌ Error during page state reset:`, {
+        error: error instanceof Error ? error.message : String(error),
+        targetNodeId,
+      });
+
+      return null;
+    }
   }
 }

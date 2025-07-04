@@ -47,7 +47,12 @@ export interface PageData {
 export interface ExecutedStep {
   step: number;
   timestamp: string;
-  tool_used: "page_act" | "page_extract" | "user_input" | "standby";
+  tool_used:
+    | "page_act"
+    | "backtrack"
+    | "user_input"
+    | "standby"
+    | "actionables";
   instruction: string;
   success: boolean;
   result?: string;
@@ -66,27 +71,57 @@ export interface ExecutedStep {
 // Single input request within a multi-input request
 export interface InputRequest {
   inputKey: string;
-  inputType: "text" | "email" | "password" | "url" | "otp" | "phone" | "boolean";
+  inputType:
+    | "text"
+    | "email"
+    | "password"
+    | "url"
+    | "otp"
+    | "phone"
+    | "boolean";
   inputPrompt: string;
 }
 
 // LLM Decision Response
 export interface LLMDecisionResponse {
   reasoning: string;
-  tool_to_use: "page_act" | "page_extract" | "user_input" | "standby";
+  tool_to_use:
+    | "page_act"
+    | "user_input"
+    | "standby"
+    | "backtrack"
+    | "actionables";
   tool_parameters: {
     instruction: string;
     // For single input (backward compatibility)
     inputKey?: string;
-    inputType?: "text" | "email" | "password" | "url" | "otp" | "phone" | "boolean";
+    inputType?:
+      | "text"
+      | "email"
+      | "password"
+      | "url"
+      | "otp"
+      | "phone"
+      | "boolean";
     inputPrompt?: string;
     sensitive?: boolean;
     // For multiple inputs (new)
     inputs?: InputRequest[];
     // For standby tool
     waitTimeSeconds?: number;
+    // For actionables tool
+    actionables?: {
+      text: string;
+      instruction: string;
+      elementType?: string;
+      actionType: "click" | "hover" | "scroll";
+    }[];
   };
-  next_plan: string;
+  actions: {
+    id: string;
+    action: string;
+    actionType: "hover" | "click";
+  }[];
   isCurrentPageExecutionCompleted: boolean;
   isInSensitiveFlow?: boolean;
 }
@@ -150,6 +185,11 @@ export interface UserInputRequest {
   timestamp: string;
 }
 
+export interface UserInputSocketResponse {
+  inputs?: { [key: string]: string };
+  isSkipped?: boolean;
+}
+
 export interface UserInputData {
   key: string;
   value: string;
@@ -159,7 +199,12 @@ export interface UserInputData {
 
 export interface FlowContext {
   isInSensitiveFlow: boolean;
-  flowType?: "login" | "signup" | "verification" | "checkout" | "form_submission";
+  flowType?:
+    | "login"
+    | "signup"
+    | "verification"
+    | "checkout"
+    | "form_submission";
   startUrl?: string;
   flowStartStep?: number;
 }
@@ -184,4 +229,3 @@ export interface ExplorationSession {
   flowContext: FlowContext; // Track sensitive flows to prevent URL queuing interference
   actionHistory: ActionHistoryEntry[]; // Persistent history of all page_act instructions and their URL outcomes
 }
- 

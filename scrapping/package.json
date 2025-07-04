@@ -1,40 +1,58 @@
 {
   "name": "intelligent-web-scraper-ts",
   "version": "1.0.0",
-  "description": "TypeScript-based Intelligent Web Scraper with LLM-driven exploration",
+  "description": "AI-driven web exploration and scraping tool with real-time frontend",
   "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
   "scripts": {
     "build": "tsc",
-    "start": "tsx src/index.ts",
-    "dev": "tsx watch src/index.ts",
-    "test": "tsx src/index.ts",
-    "test-tools": "tsx test-all-clients.ts",
-    "socket": "tsx src/socket-server.ts",
-    "socket:dev": "tsx watch src/socket-server.ts"
+    "start": "node dist/index.js",
+    "start:socket": "node dist/socket-server.js",
+    "dev": "tsc && node dist/index.js",
+    "dev:socket": "tsc && node dist/socket-server.js",
+    "test": "node tests/test-all-clients.js",
+    "test:tools": "node tests/test-individual-tools.js",
+    "test:gemini": "node tests/test-gemini.js",
+    "clean": "rm -rf dist",
+    "type-check": "tsc --noEmit",
+    "lint": "echo 'Add linting tool of choice'",
+    "format": "echo 'Add formatting tool of choice'"
   },
+  "keywords": [
+    "web-scraping",
+    "ai",
+    "automation",
+    "playwright",
+    "stagehand",
+    "claude",
+    "anthropic"
+  ],
+  "author": "Your Name",
+  "license": "MIT",
   "dependencies": {
-    "@ai-sdk/anthropic": "^1.0.6",
-    "@ai-sdk/google-vertex": "^2.0.6",
-    "@ai-sdk/openai": "^1.0.14",
-    "@anthropic-ai/sdk": "^0.28.0",
-    "@browserbasehq/stagehand": "^2.3.1",
-    "@types/socket.io": "^3.0.1",
-    "ai": "^4.0.32",
-    "crypto": "^1.0.1",
-    "dotenv": "^16.0.3",
-    "openai": "^4.80.0",
+    "@ai-sdk/anthropic": "^1.2.12",
+    "@ai-sdk/google": "^1.2.21",
+    "@ai-sdk/google-vertex": "^2.2.26",
+    "@ai-sdk/openai": "^1.0.10",
+    "@anthropic-ai/sdk": "^0.55.1",
+    "@browserbasehq/stagehand": "^2.4.0",
+    "@opentelemetry/sdk-node": "^0.202.0",
+    "ai": "^4.0.33",
+    "dotenv": "^16.4.7",
+    "langfuse": "^3.38.1",
+    "langfuse-vercel": "^3.38.1",
     "playwright": "^1.49.1",
     "sharp": "^0.33.5",
     "socket.io": "^4.8.1",
-    "typescript": "^5.0.0",
-    "uuid": "^9.0.0",
-    "winston": "^3.15.0",
+    "winston": "^3.17.0",
     "zod": "^3.24.1"
   },
   "devDependencies": {
-    "@types/node": "^24.0.7",
-    "@types/sharp": "^0.31.1",
-    "@types/uuid": "^9.0.0",
-    "tsx": "^4.0.0"
+    "@types/node": "^22.16.0",
+    "typescript": "^5.7.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }

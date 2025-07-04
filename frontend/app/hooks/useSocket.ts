@@ -9,10 +9,11 @@ import type {
   PageStatus,
   SessionCompletion,
   PageObserveResult,
-  PageExtractResult,
   PageActResult,
   StandbyResult,
-  UserInputRequest
+  UserInputRequest,
+  InteractionGraph,
+  ChatMessage
 } from '../types/exploration';
 
 const SOCKET_URL = 'http://localhost:3001';
@@ -25,7 +26,6 @@ const initialState: ExplorationState = {
   decisions: [],
   toolResults: {
     observe: [],
-    extract: [],
     act: [],
     standby: []
   },
@@ -34,7 +34,15 @@ const initialState: ExplorationState = {
   sessionCompletion: null,
   totalSteps: 0,
   activeToolExecution: null,
-  userInputRequest: null
+  userInputRequest: null,
+  graphs: {},
+  trees: {},
+  chatState: {
+    messages: [],
+    isActive: false,
+    isProcessing: false
+  },
+  isGraphUpdating: false
 };
 
 export function useSocket() {
@@ -80,6 +88,24 @@ export function useSocket() {
     // Real-time exploration updates
     newSocket.on('exploration_update', (update: ExplorationUpdate) => {
       handleExplorationUpdate(update);
+    });
+
+    // Direct chat error events (not through exploration_update)
+    newSocket.on('chat_error', (data: { userName: string; error: string; timestamp: string }) => {
+      setExplorationState(prev => ({
+        ...prev,
+        chatState: {
+          ...prev.chatState,
+          isProcessing: false,
+          messages: [...prev.chatState.messages, {
+            id: Date.now().toString(),
+            type: 'assistant',
+            content: `Error: ${data.error}`,
+            timestamp: data.timestamp
+          } as ChatMessage]
+        }
+      }));
+      console.error('❌ Chat error (direct)', data);
     });
 
     return () => {
@@ -137,13 +163,13 @@ export function useSocket() {
             activeToolExecution: null
           };
 
-        case 'page_extract_result':
+        case 'after_page_act':
+          // Handle screenshot capture after page action
           return {
             ...prev,
-            toolResults: {
-              ...prev.toolResults,
-              extract: [...prev.toolResults.extract, { ...data, timestamp: update.timestamp } as PageExtractResult]
-            }
+            screenshots: data.screenshot ? 
+              [...prev.screenshots, { ...data, timestamp: update.timestamp } as ScreenshotData] :
+              prev.screenshots
           };
 
         case 'page_act_result':
@@ -195,6 +221,82 @@ export function useSocket() {
             }
           };
 
+        // New graph events
+        case 'updating_graph':
+          return {
+            ...prev,
+            isGraphUpdating: true
+          };
+
+        case 'graph_updated':
+          return {
+            ...prev,
+            isGraphUpdating: false,
+            graphs: {
+              ...prev.graphs,
+              [data.urlHash]: data.graph as InteractionGraph
+            },
+            pageStatuses: prev.pageStatuses.map(p => 
+              p.urlHash === data.urlHash 
+                ? { ...p, hasGraph: true, graphLastUpdated: update.timestamp }
+                : p
+            )
+          };
+
+        case 'tree_updated':
+          console.log('🌳 Tree updated event received:', data);
+          console.log('🌳 Tree structure:', data.treeStructure);
+          console.log('🌳 URL Hash:', data.urlHash);
+          return {
+            ...prev,
+            trees: {
+              ...prev.trees,
+              [data.urlHash]: data.treeStructure
+            }
+          };
+
+        // New chat events
+        case 'chat_message':
+          return {
+            ...prev,
+            chatState: {
+              ...prev.chatState,
+              messages: [...prev.chatState.messages, {
+                id: data.id || Date.now().toString(),
+                type: data.type,
+                content: data.content,
+                timestamp: update.timestamp,
+                requestType: data.requestType
+              } as ChatMessage],
+              isProcessing: data.type === 'user' // Processing when user sends message
+            }
+          };
+
+        case 'chat_navigation':
+          return {
+            ...prev,
+            chatState: {
+              ...prev.chatState,
+              isProcessing: false
+            },
+            currentPage: data.url
+          };
+
+        case 'chat_error':
+          return {
+            ...prev,
+            chatState: {
+              ...prev.chatState,
+              isProcessing: false,
+              messages: [...prev.chatState.messages, {
+                id: Date.now().toString(),
+                type: 'assistant',
+                content: `Error: ${data.error}`,
+                timestamp: update.timestamp
+              } as ChatMessage]
+            }
+          };
+
         default:
           return prev;
       }
@@ -228,12 +330,61 @@ export function useSocket() {
     }
   }, [socket, explorationState.userInputRequest]);
 
+  const skipUserInput = useCallback(() => {
+    if (socket && explorationState.userInputRequest) {
+      socket.emit('user_input_response', { isSkipped: true });
+      console.log('⏭️ Skipping user input');
+    }
+  }, [socket, explorationState.userInputRequest]);
+
+  // New chat functionality
+  const sendChatMessage = useCallback((message: string, userName: string) => {
+    if (socket && explorationState.isConnected) {
+      const chatData = {
+        userName: userName,
+        message: message
+      };
+      
+      socket.emit('chat_message', chatData);
+      console.log('💬 Sending chat message:', { userName, message });
+      
+      // Add user message immediately to UI
+      const timestamp = new Date().toISOString();
+      setExplorationState(prev => ({
+        ...prev,
+        chatState: {
+          ...prev.chatState,
+          messages: [...prev.chatState.messages, {
+            id: Date.now().toString(),
+            type: 'user',
+            content: message,
+            timestamp: timestamp
+          } as ChatMessage],
+          isProcessing: true
+        }
+      }));
+    }
+  }, [socket, explorationState.isConnected]);
+
+  const toggleChatMode = useCallback(() => {
+    setExplorationState(prev => ({
+      ...prev,
+      chatState: {
+        ...prev.chatState,
+        isActive: !prev.chatState.isActive
+      }
+    }));
+  }, []);
+
   return {
     socket,
     explorationState,
     startExploration,
     stopExploration,
     submitUserInput,
+    skipUserInput,
+    sendChatMessage,
+    toggleChatMode,
     isConnected: explorationState.isConnected,
     isRunning: explorationState.isRunning
   };
