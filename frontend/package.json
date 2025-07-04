@@ -9,6 +9,7 @@
     "typecheck": "react-router typegen && tsc"
   },
   "dependencies": {
+    "@dagrejs/dagre": "^1.1.5",
     "@lexical/code": "^0.32.1",
     "@lexical/html": "^0.32.1",
     "@lexical/link": "^0.32.1",

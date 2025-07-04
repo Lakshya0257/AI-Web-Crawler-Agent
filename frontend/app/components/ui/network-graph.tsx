@@ -16,7 +16,9 @@ import {
   type Node,
   type Edge,
   type NodeProps,
+  type Connection,
 } from "@xyflow/react";
+import dagre from "@dagrejs/dagre";
 import "@xyflow/react/dist/style.css";
 
 import { Card, CardContent, CardHeader, CardTitle } from "./card";
@@ -47,6 +49,8 @@ import {
   Hash,
   Layers,
   ArrowRight,
+  GitBranch,
+  ArrowDown,
 } from "lucide-react";
 import type {
   InteractionGraph,
@@ -56,11 +60,16 @@ import type {
 } from "../../types/exploration";
 import { Separator } from "./separator";
 import { ScrollArea } from "./scroll-area";
+import { cn } from "../../lib/utils";
 
 interface NetworkGraphProps {
   graph: InteractionGraph;
   className?: string;
 }
+
+// Node dimensions matching your requirements
+const nodeWidth = 400;
+const nodeHeight = 300;
 
 const getFlowColor = (flowType: string) => {
   switch (flowType) {
@@ -95,21 +104,41 @@ const getFlowColor = (flowType: string) => {
   }
 };
 
+// Custom node data types
+interface ImageNodeData extends ImageNode, Record<string, unknown> {
+  nodeType: "image";
+}
+
+interface FlowContainerData extends Record<string, unknown> {
+  nodeType: "flowContainer";
+  flow: FlowDefinition;
+}
+
+type CustomNodeData = ImageNodeData | FlowContainerData;
+
 // Simple Image Node Component
-const ImageNodeComponent = ({ data, isConnectable }: NodeProps) => {
+const ImageNodeComponent: React.FC<NodeProps> = ({
+  data,
+  isConnectable,
+}) => {
   const [imageError, setImageError] = useState(false);
-  const nodeData = data as unknown as ImageNode;
+  const nodeData = data as ImageNodeData;
 
   return (
     <div className="relative group cursor-pointer">
       <Handle
         type="target"
-        position={Position.Left}
+        position={Position.Top}
         isConnectable={isConnectable}
         className="opacity-0"
+        style={{
+          background: "#3b82f6",
+          width: 8,
+          height: 8,
+        }}
       />
 
-      <div className="w-[800px] h-[600px] rounded-lg overflow-hidden shadow-lg ring-2 ring-white/50 hover:ring-4 hover:ring-blue-400/50 transition-all duration-200">
+      <div className="w-[400px] h-[300px] rounded-lg overflow-hidden shadow-lg ring-2 ring-white/50 hover:ring-4 hover:ring-blue-400/50 transition-all duration-200">
         {!imageError ? (
           <img
             src={nodeData.imageData}
@@ -138,35 +167,54 @@ const ImageNodeComponent = ({ data, isConnectable }: NodeProps) => {
 
       <Handle
         type="source"
-        position={Position.Right}
+        position={Position.Bottom}
         isConnectable={isConnectable}
         className="opacity-0"
+        style={{
+          background: "#3b82f6",
+          width: 8,
+          height: 8,
+        }}
       />
     </div>
   );
 };
 
 // Flow Container Node Component
-const FlowContainerNode = ({ data }: NodeProps) => {
-  const flowData = data as { flow: FlowDefinition };
-  const colors = getFlowColor(flowData.flow.flowType);
+const FlowContainerNode: React.FC<NodeProps> = ({
+  data,
+}) => {
+  const nodeData = data as FlowContainerData;
+  const colors = getFlowColor(nodeData.flow.flowType);
 
   return (
     <div
-      className="px-3 py-1.5 rounded-full shadow-sm border backdrop-blur-sm"
+      className="px-4 py-2 rounded-lg shadow-sm border-2 backdrop-blur-sm bg-white"
       style={{
-        backgroundColor: colors.soft + "60",
-        borderColor: colors.border + "80",
+        borderColor: colors.border + "40",
       }}
     >
-      <div className="flex items-center gap-1.5">
+      <div className="flex items-center gap-2">
         <div
-          className="w-1.5 h-1.5 rounded-full"
+          className="w-3 h-3 rounded-full"
           style={{ backgroundColor: colors.bg }}
         />
-        <span className="text-xs font-medium" style={{ color: colors.border }}>
-          {flowData.flow.name}
+        <span
+          className="text-sm font-semibold"
+          style={{ color: colors.border }}
+        >
+          {nodeData.flow.name}
         </span>
+        <Badge
+          variant="outline"
+          className="text-xs"
+          style={{
+            borderColor: colors.border,
+            color: colors.border,
+          }}
+        >
+          {nodeData.flow.imageNodes.length} states
+        </Badge>
       </div>
     </div>
   );
@@ -177,153 +225,237 @@ const nodeTypes = {
   flowContainer: FlowContainerNode,
 };
 
+// Dagre layout function
+const getLayoutedElements = (
+  nodes: Node[],
+  edges: Edge[],
+  direction = "TB"
+) => {
+  const dagreGraph = new dagre.graphlib.Graph();
+  dagreGraph.setDefaultEdgeLabel(() => ({}));
+
+  const isHorizontal = direction === "LR";
+  dagreGraph.setGraph({ rankdir: direction, nodesep: 100, ranksep: 150 });
+
+  nodes.forEach((node) => {
+    const width = node.type === "flowContainer" ? 200 : nodeWidth;
+    const height = node.type === "flowContainer" ? 50 : nodeHeight;
+    dagreGraph.setNode(node.id, { width, height });
+  });
+
+  edges.forEach((edge) => {
+    dagreGraph.setEdge(edge.source, edge.target);
+  });
+
+  dagre.layout(dagreGraph);
+
+  const newNodes = nodes.map((node) => {
+    const nodeWithPosition = dagreGraph.node(node.id);
+    const width = node.type === "flowContainer" ? 200 : nodeWidth;
+    const height = node.type === "flowContainer" ? 50 : nodeHeight;
+
+    const newNode = {
+      ...node,
+      targetPosition: isHorizontal ? "left" : "top",
+      sourcePosition: isHorizontal ? "right" : "bottom",
+      position: {
+        x: nodeWithPosition.x - width / 2,
+        y: nodeWithPosition.y - height / 2,
+      },
+    };
+
+    return newNode;
+  });
+
+  return { nodes: newNodes, edges };
+};
+
 export function NetworkGraph({ graph, className = "" }: NetworkGraphProps) {
-  console.log("Graph", graph);
-  console.log(
-    "Graph nodes:",
-    graph.nodes.map((n) => ({ id: n.id, flows: n.metadata?.flowsConnected }))
-  );
-  console.log(
-    "Graph edges:",
-    graph.edges.map((e) => ({ from: e.from, to: e.to, action: e.action }))
-  );
   const [selectedElement, setSelectedElement] = useState<{
     type: "node" | "edge";
     data: any;
   } | null>(null);
   const [showSidePanel, setShowSidePanel] = useState(false);
   const [showCanvas, setShowCanvas] = useState(false);
+  const [layoutDirection, setLayoutDirection] = useState<"TB" | "LR">("TB");
 
   const formatTime = (timestamp: string): string => {
     return new Date(timestamp).toLocaleTimeString();
   };
 
-  // Convert graph data to React Flow format
+  // Convert graph data to React Flow format with dagre layout
   const { nodes: initialNodes, edges: initialEdges } = useMemo(() => {
-    const nodes: Node[] = [];
-    const edges: Edge[] = [];
+    const allNodes: Node[] = [];
+    const allEdges: Edge[] = [];
 
-    // Group nodes by flows
-    const flowGroups: { [flowId: string]: ImageNode[] } = {};
-    const processedNodes = new Set<string>();
+    // Process each flow separately to create individual dagre trees
+    let xOffset = 0;
 
-    graph.nodes.forEach((node) => {
-      if ((node.metadata?.flowsConnected || []).length > 0) {
-        (node.metadata?.flowsConnected || []).forEach((flowId) => {
-          if (!flowGroups[flowId]) {
-            flowGroups[flowId] = [];
-          }
-          flowGroups[flowId].push(node);
-        });
-      }
-    });
+    if (graph.flows && graph.flows.length > 0) {
+      graph.flows.forEach((flow, flowIndex) => {
+        const flowNodes: Node[] = [];
+        const flowEdges: Edge[] = [];
 
-    let currentY = 0; // Start from top
-
-    // Create flow container nodes and image nodes
-    Object.entries(flowGroups).forEach(([flowId, flowNodes], flowIndex) => {
-      const flow = graph.flows?.find((f) => f.id === flowId);
-      if (!flow) return;
-
-      // Flow container node - positioned just above images
-      const flowContainerY = currentY;
-      const imageRowY = currentY + 400; // Images 40px below flow label
-
-      const flowContainerId = `flow-${flowId}`;
-      nodes.push({
-        id: flowContainerId,
-        type: "flowContainer",
-        position: { x: 20, y: flowContainerY },
-        data: { flow },
-        draggable: true,
-      });
-
-      // Image nodes in this flow
-      flowNodes.forEach((node, index) => {
-        const nodeId = `${node.id}-${flowId}`;
-        const xOffset = 300 + index * 1000; // Desktop spacing for 800px wide images
-
-        nodes.push({
-          id: nodeId,
-          type: "imageNode",
-          position: { x: xOffset, y: 0 },
-          data: node as any,
+        // Add flow container node
+        const flowContainerId = `flow-container-${flow.id}`;
+        flowNodes.push({
+          id: flowContainerId,
+          type: "flowContainer",
+          position: { x: 0, y: 0 }, // Will be set by dagre
+          data: {
+            nodeType: "flowContainer" as const,
+            flow: flow,
+          } as FlowContainerData,
           draggable: true,
-          parentId: flowContainerId,
         });
 
-        processedNodes.add(node.id);
-      });
+        // Add all image nodes for this flow
+        const nodeMapping = new Map<string, string>(); // Original ID to flow-specific ID
 
-      // Move to next row: current image row + image height + gap
-      currentY = imageRowY + 400; // 600px image + 80px gap to next flow
-    });
+        flow.imageNodes.forEach((nodeId) => {
+          const node = graph.nodes.find((n) => n.id === nodeId);
+          if (node) {
+            const flowNodeId = `${nodeId}-${flow.id}`;
+            nodeMapping.set(nodeId, flowNodeId);
 
-    // Create edges - we need to find which flows contain the source and target nodes
-    graph.edges.forEach((edge: ImageEdge, index: number) => {
-      // Find the flows that contain both source and target nodes
-      const sourceNode = graph.nodes.find((n) => n.id === edge.from);
-      const targetNode = graph.nodes.find((n) => n.id === edge.to);
+            flowNodes.push({
+              id: flowNodeId,
+              type: "imageNode",
+              position: { x: 0, y: 0 }, // Will be set by dagre
+              data: {
+                ...node,
+                nodeType: "image" as const,
+              } as ImageNodeData,
+              draggable: true,
+            });
+          }
+        });
 
-      if (!sourceNode || !targetNode) {
-        console.warn(
-          `Edge ${edge.from} -> ${edge.to}: Could not find source or target node`
+        // Add edges for this flow
+        graph.edges.forEach((edge, edgeIndex) => {
+          const sourceInFlow = flow.imageNodes.includes(edge.from);
+          const targetInFlow = flow.imageNodes.includes(edge.to);
+
+          if (sourceInFlow && targetInFlow) {
+            const sourceId = nodeMapping.get(edge.from);
+            const targetId = nodeMapping.get(edge.to);
+
+            if (sourceId && targetId) {
+              flowEdges.push({
+                id: `edge-${flow.id}-${edgeIndex}`,
+                source: sourceId,
+                target: targetId,
+                animated: false,
+                label: edge.action || edge.instruction.substring(0, 30) + "...",
+                labelStyle: {
+                  fill: "#000000",
+                  fontWeight: 500,
+                  fontSize: "11px",
+                  backgroundColor: "rgba(255, 255, 255, 0.95)",
+                  borderRadius: "3px",
+                  padding: "2px 6px",
+                },
+                labelBgStyle: {
+                  fill: "rgba(255, 255, 255, 0.95)",
+                  fillOpacity: 0.95,
+                },
+                style: {
+                  stroke: getFlowColor(flow.flowType).border,
+                  strokeWidth: 2,
+                  cursor: "pointer",
+                },
+                markerEnd: {
+                  type: MarkerType.ArrowClosed,
+                  width: 20,
+                  height: 20,
+                  color: getFlowColor(flow.flowType).border,
+                },
+                data: {...edge},
+              });
+            }
+          }
+        });
+
+        // Connect flow container to first nodes
+        if (flow.startImageName) {
+          const startNodeId = nodeMapping.get(flow.startImageName);
+          if (startNodeId) {
+            flowEdges.push({
+              id: `edge-container-${flow.id}`,
+              source: flowContainerId,
+              target: startNodeId,
+              animated: false,
+              style: {
+                stroke: getFlowColor(flow.flowType).border,
+                strokeWidth: 2,
+                strokeDasharray: "5 5",
+              },
+              markerEnd: {
+                type: MarkerType.ArrowClosed,
+                width: 20,
+                height: 20,
+                color: getFlowColor(flow.flowType).border,
+              },
+            });
+          }
+        }
+
+        // Layout this flow with dagre
+        const { nodes: layoutedFlowNodes, edges: layoutedFlowEdges } =
+          getLayoutedElements(flowNodes, flowEdges, layoutDirection);
+
+        // Offset the flow to avoid overlap
+        const offsetNodes = layoutedFlowNodes.map((node) => ({
+          ...node,
+          position: {
+            x: node.position.x + xOffset,
+            y: node.position.y,
+          },
+          sourcePosition: node.sourcePosition as Position,
+          targetPosition: node.targetPosition as Position,
+        }));
+
+        allNodes.push(...offsetNodes);
+        allEdges.push(...layoutedFlowEdges);
+
+        // Calculate next offset based on flow width
+        const maxX = Math.max(
+          ...offsetNodes.map(
+            (n) => n.position.x + (n.type === "flowContainer" ? 200 : nodeWidth)
+          )
         );
-        return;
-      }
+        xOffset = maxX + 200; // Add gap between flows
+      });
+    }
 
-      // Find common flows between source and target nodes
-      const sourceFlows = sourceNode.metadata?.flowsConnected || [];
-      const targetFlows = targetNode.metadata?.flowsConnected || [];
-      const commonFlows = sourceFlows.filter((flow) =>
-        targetFlows.includes(flow)
+    // Handle nodes not in any flow
+    const nodesInFlows = new Set(
+      graph.flows?.flatMap((f) => f.imageNodes) || []
+    );
+    const orphanNodes = graph.nodes.filter((n) => !nodesInFlows.has(n.id));
+
+    if (orphanNodes.length > 0) {
+      const orphanFlowNodes: Node[] = orphanNodes.map(
+        (node, index) => ({
+          id: node.id,
+          type: "imageNode",
+          position: { x: 0, y: 0 }, // Will be set by dagre
+          data: {
+            ...node,
+            nodeType: "image" as const,
+          } as ImageNodeData,
+          draggable: true,
+        })
       );
 
-      // Create edges for each common flow (usually there will be one)
-      if (commonFlows.length > 0) {
-        commonFlows.forEach((flowId, flowIndex) => {
-          const sourceId = `${edge.from}-${flowId}`;
-          const targetId = `${edge.to}-${flowId}`;
-
-          edges.push({
-            id: `edge-${index}-${flowIndex}`,
-            source: sourceId,
-            target: targetId,
-            animated: false, // Removed animation for clean minimal style
-            label: edge.action || edge.instruction.substring(0, 30) + "...", // Show action label
-            labelStyle: {
-              fill: "#000000", // Black text for minimal style
-              fontWeight: 500,
-              fontSize: "11px",
-              backgroundColor: "rgba(255, 255, 255, 0.95)",
-              borderRadius: "3px",
-              padding: "1px 4px",
-            },
-            labelBgStyle: {
-              fill: "rgba(255, 255, 255, 0.95)",
-              fillOpacity: 0.95,
-            },
-            style: {
-              stroke: "#000000", // Solid black for minimal style
-              strokeWidth: 2, // Clean 2px width
-              cursor: "pointer",
-            },
-            markerEnd: {
-              type: MarkerType.ArrowClosed,
-              width: 16,
-              height: 16,
-              color: "#000000", // Black arrow for minimal style
-            },
-            data: edge as any,
-          });
-        });
-      } else {
-        // If no common flows, try to create edge without flow suffix
-        console.warn(
-          `Edge ${edge.from} -> ${edge.to}: No common flows found, attempting direct connection`
-        );
-        edges.push({
-          id: `edge-${index}`,
+      const orphanEdges: Edge[] = graph.edges
+        .filter(
+          (edge) =>
+            orphanNodes.some((n) => n.id === edge.from) &&
+            orphanNodes.some((n) => n.id === edge.to)
+        )
+        .map((edge, index) => ({
+          id: `edge-orphan-${index}`,
           source: edge.from,
           target: edge.to,
           animated: false,
@@ -334,49 +466,48 @@ export function NetworkGraph({ graph, className = "" }: NetworkGraphProps) {
             fontSize: "11px",
             backgroundColor: "rgba(255, 255, 255, 0.95)",
             borderRadius: "3px",
-            padding: "1px 4px",
-          },
-          labelBgStyle: {
-            fill: "rgba(255, 255, 255, 0.95)",
-            fillOpacity: 0.95,
+            padding: "2px 6px",
           },
           style: {
-            stroke: "#000000",
+            stroke: "#6b7280",
             strokeWidth: 2,
             cursor: "pointer",
           },
           markerEnd: {
             type: MarkerType.ArrowClosed,
-            width: 16,
-            height: 16,
-            color: "#000000",
+            width: 20,
+            height: 20,
+            color: "#6b7280",
           },
-          data: edge as any,
-        });
+          data: {...edge},
+        }));
+
+      if (orphanFlowNodes.length > 0) {
+        const { nodes: layoutedOrphanNodes, edges: layoutedOrphanEdges } =
+          getLayoutedElements(orphanFlowNodes, orphanEdges, layoutDirection);
+
+        const offsetOrphanNodes = layoutedOrphanNodes.map((node) => ({
+          ...node,
+          position: {
+            x: node.position.x + xOffset,
+            y: node.position.y,
+          },
+          sourcePosition: node.sourcePosition as Position,
+          targetPosition: node.targetPosition as Position,
+        }));
+
+        allNodes.push(...offsetOrphanNodes);
+        allEdges.push(...layoutedOrphanEdges);
       }
-    });
+    }
 
-    console.log(
-      "Created nodes:",
-      nodes.map((n) => ({ id: n.id, type: n.type, position: n.position }))
-    );
-    console.log(
-      "Created edges:",
-      edges.map((e) => ({
-        id: e.id,
-        source: e.source,
-        target: e.target,
-        label: e.label,
-      }))
-    );
-
-    return { nodes, edges };
-  }, [graph]);
+    return { nodes: allNodes, edges: allEdges };
+  }, [graph, layoutDirection]);
 
   const [nodes, setNodes, onNodesChange] = useNodesState(initialNodes);
   const [edges, setEdges, onEdgesChange] = useEdgesState(initialEdges);
 
-  // Update nodes and edges when graph changes
+  // Update nodes and edges when graph or layout changes
   useEffect(() => {
     setNodes(initialNodes);
     setEdges(initialEdges);
@@ -394,51 +525,82 @@ export function NetworkGraph({ graph, className = "" }: NetworkGraphProps) {
     setShowSidePanel(true);
   }, []);
 
+  const onLayout = useCallback((direction: "TB" | "LR") => {
+    setLayoutDirection(direction);
+  }, []);
+
   if (showCanvas) {
     return (
-      <div className="fixed inset-0 z-50 bg-background">
-        <div className="absolute top-4 right-4 z-10 flex gap-2">
+      <div className="fixed inset-0 z-50 bg-gray-100">
+        <div className="absolute top-4 left-4 right-4 z-10 flex justify-between items-center">
+          <div className="flex items-center gap-4">
+            <h3 className="text-lg font-semibold">Flow Visualization</h3>
+            <div className="flex gap-2">
+              <Button
+                onClick={() => onLayout("TB")}
+                size="sm"
+                variant={layoutDirection === "TB" ? "default" : "outline"}
+                className="gap-2"
+              >
+                <ArrowDown className="w-4 h-4" />
+                Vertical
+              </Button>
+              <Button
+                onClick={() => onLayout("LR")}
+                size="sm"
+                variant={layoutDirection === "LR" ? "default" : "outline"}
+                className="gap-2"
+              >
+                <ArrowRight className="w-4 h-4" />
+                Horizontal
+              </Button>
+            </div>
+          </div>
           <Button
             onClick={() => setShowCanvas(false)}
             size="sm"
             variant="outline"
-            className="bg-white/90 backdrop-blur-sm"
+            className="bg-white"
           >
             <X className="w-4 h-4 mr-1" />
             Close Canvas
           </Button>
         </div>
 
-        <ReactFlow
-          nodes={nodes}
-          edges={edges}
-          onNodesChange={onNodesChange}
-          onEdgesChange={onEdgesChange}
-          onNodeClick={onNodeClick}
-          onEdgeClick={onEdgeClick}
-          nodeTypes={nodeTypes}
-          connectionLineType={ConnectionLineType.SmoothStep}
-          fitView
-          className="bg-gray-50"
-        >
-          <Background
-            variant={BackgroundVariant.Dots}
-            gap={20}
-            size={1}
-            color="#e5e7eb"
-          />
-          <Controls className="bg-white/90 backdrop-blur-sm rounded-lg shadow-lg" />
-          <MiniMap
-            nodeStrokeColor="#3b82f6"
-            nodeColor="#f3f4f6"
-            nodeBorderRadius={8}
-            className="bg-white/90 backdrop-blur-sm rounded-lg shadow-lg"
-          />
-        </ReactFlow>
+        <div className="pt-16 h-full">
+          <ReactFlow
+            nodes={nodes}
+            edges={edges}
+            onNodesChange={onNodesChange}
+            onEdgesChange={onEdgesChange}
+            onNodeClick={onNodeClick}
+            onEdgeClick={onEdgeClick}
+            nodeTypes={nodeTypes}
+            connectionLineType={ConnectionLineType.SmoothStep}
+            fitView
+            fitViewOptions={{ padding: 0.2 }}
+            minZoom={0.1}
+            maxZoom={2}
+          >
+            <Background
+              variant={BackgroundVariant.Dots}
+              gap={20}
+              size={1}
+              color="#e5e7eb"
+            />
+            <Controls className="bg-white/90 backdrop-blur-sm rounded-lg shadow-lg" />
+            <MiniMap
+              nodeStrokeColor="#3b82f6"
+              nodeColor="#f3f4f6"
+              nodeBorderRadius={8}
+              className="bg-white/90 backdrop-blur-sm rounded-lg shadow-lg"
+            />
+          </ReactFlow>
+        </div>
 
         {/* Side Panel */}
         {showSidePanel && selectedElement && (
-          <div className="absolute top-0 right-0 h-full w-96 bg-white shadow-2xl border-l border-gray-200 z-20">
+          <div className="absolute top-16 right-0 h-[calc(100%-4rem)] w-96 bg-white shadow-2xl border-l border-gray-200 z-20">
             <div className="flex items-center justify-between p-4 border-b">
               <h3 className="font-semibold text-lg">
                 {selectedElement.type === "node"
@@ -456,14 +618,15 @@ export function NetworkGraph({ graph, className = "" }: NetworkGraphProps) {
 
             <ScrollArea className="h-[calc(100%-64px)]">
               <div className="p-4 space-y-4">
-                {selectedElement.type === "node" ? (
+                {selectedElement.type === "node" &&
+                selectedElement.data.nodeType === "image" ? (
                   // Node Details
                   <>
                     <div className="aspect-video rounded-lg overflow-hidden border">
                       <img
                         src={selectedElement.data.imageData}
                         alt={`Step ${selectedElement.data.stepNumber}`}
-                        className="w-full h-full object-cover"
+                        className="w-full h-full object-contain bg-white"
                       />
                     </div>
 
@@ -482,7 +645,7 @@ export function NetworkGraph({ graph, className = "" }: NetworkGraphProps) {
 
                       <div>
                         <h4 className="font-medium mb-1">Instruction</h4>
-                        <p className="text-sm text-gray-600">
+                        <p className="text-sm text-gray-600 bg-gray-50 p-3 rounded-lg">
                           {selectedElement.data.instruction}
                         </p>
                       </div>
@@ -523,20 +686,18 @@ export function NetworkGraph({ graph, className = "" }: NetworkGraphProps) {
 
                       <div>
                         <h4 className="font-medium mb-1">Visible Elements</h4>
-                        <div className="space-y-1">
+                        <div className="space-y-1 max-h-32 overflow-y-auto">
                           {(
                             selectedElement.data.metadata?.visibleElements || []
-                          )
-                            .slice(0, 5)
-                            .map((element: string, idx: number) => (
-                              <div
-                                key={idx}
-                                className="text-xs text-gray-500 flex items-start gap-1"
-                              >
-                                <Circle className="w-2 h-2 mt-1 flex-shrink-0" />
-                                {element}
-                              </div>
-                            ))}
+                          ).map((element: string, idx: number) => (
+                            <div
+                              key={idx}
+                              className="text-xs text-gray-500 flex items-start gap-1 p-2 bg-gray-50 rounded"
+                            >
+                              <Eye className="w-3 h-3 mt-0.5 flex-shrink-0" />
+                              {element}
+                            </div>
+                          ))}
                         </div>
                       </div>
 
@@ -544,39 +705,37 @@ export function NetworkGraph({ graph, className = "" }: NetworkGraphProps) {
                         <h4 className="font-medium mb-1">
                           Interactive Elements
                         </h4>
-                        <div className="space-y-1">
+                        <div className="space-y-1 max-h-32 overflow-y-auto">
                           {(
                             selectedElement.data.metadata?.clickableElements ||
                             []
-                          )
-                            .slice(0, 5)
-                            .map((element: string, idx: number) => (
-                              <div
-                                key={idx}
-                                className="text-xs text-gray-500 flex items-start gap-1"
-                              >
-                                <MousePointer className="w-2 h-2 mt-1 flex-shrink-0" />
-                                {element}
-                              </div>
-                            ))}
+                          ).map((element: string, idx: number) => (
+                            <div
+                              key={idx}
+                              className="text-xs text-gray-500 flex items-start gap-1 p-2 bg-blue-50 rounded"
+                            >
+                              <MousePointer className="w-3 h-3 mt-0.5 flex-shrink-0 text-blue-500" />
+                              {element}
+                            </div>
+                          ))}
                         </div>
                       </div>
                     </div>
                   </>
-                ) : (
+                ) : selectedElement.type === "edge" ? (
                   // Edge Details
                   <>
                     <div className="space-y-3">
-                      <div>
+                      <div className="p-4 bg-gradient-to-r from-blue-50 to-purple-50 rounded-lg">
                         <h4 className="font-medium mb-1">Action</h4>
-                        <p className="text-sm text-gray-600">
+                        <p className="text-sm text-gray-800">
                           {selectedElement.data.action}
                         </p>
                       </div>
 
                       <div>
                         <h4 className="font-medium mb-1">Full Instruction</h4>
-                        <p className="text-sm text-gray-600">
+                        <p className="text-sm text-gray-600 bg-gray-50 p-3 rounded-lg">
                           {selectedElement.data.instruction}
                         </p>
                       </div>
@@ -600,7 +759,7 @@ export function NetworkGraph({ graph, className = "" }: NetworkGraphProps) {
                       )}
                     </div>
                   </>
-                )}
+                ) : null}
               </div>
             </ScrollArea>
           </div>
@@ -610,53 +769,74 @@ export function NetworkGraph({ graph, className = "" }: NetworkGraphProps) {
   }
 
   return (
-    <div className={`h-full w-full ${className} bg-gray-50 rounded-lg`}>
-      <div className="p-4">
-        <div className="flex items-center justify-between mb-4">
+    <div className={cn("h-full w-full bg-gray-50 rounded-lg", className)}>
+      <div className="p-6">
+        <div className="flex items-center justify-between mb-6">
           <div>
-            <h3 className="text-lg font-semibold">Visual Flow Analysis</h3>
-            <p className="text-sm text-muted-foreground">
+            <h3 className="text-xl font-semibold text-gray-800">
+              Visual Flow Analysis
+            </h3>
+            <p className="text-sm text-gray-600 mt-1">
               {graph.nodes.length} states • {graph.edges.length} transitions •{" "}
-              {graph.flows?.length || 0} flows
+              {graph.flows?.length || 0} flows discovered
             </p>
           </div>
           <Button
             onClick={() => setShowCanvas(true)}
-            size="sm"
-            className="gap-2"
+            className="bg-gradient-to-r from-blue-600 to-purple-600 hover:from-blue-700 hover:to-purple-700 text-white"
           >
-            <Expand className="w-4 h-4" />
-            View Canvas
+            <Expand className="w-4 h-4 mr-2" />
+            Open Canvas View
           </Button>
         </div>
 
-        <div className="bg-white rounded-lg border p-6 text-center">
-          <div className="max-w-md mx-auto">
-            <Network className="w-12 h-12 mx-auto mb-4 text-gray-400" />
-            <h4 className="font-medium mb-2">Interactive Flow Diagram</h4>
-            <p className="text-sm text-muted-foreground mb-4">
-              Click "View Canvas" to explore the complete interaction graph with
-              all discovered flows and states.
-            </p>
-            <div className="flex flex-wrap gap-2 justify-center">
-              {graph.flows?.map((flow) => {
-                const colors = getFlowColor(flow.flowType);
-                return (
-                  <Badge
-                    key={flow.id}
-                    variant="outline"
-                    className="text-xs"
-                    style={{
-                      backgroundColor: colors.soft + "20",
-                      borderColor: colors.border,
-                      color: colors.border,
-                    }}
-                  >
-                    {flow.name}
-                  </Badge>
-                );
-              })}
+        <div className="bg-white rounded-xl border shadow-sm p-8">
+          <div className="max-w-2xl mx-auto text-center">
+            <div className="w-20 h-20 bg-gradient-to-br from-blue-100 to-purple-100 rounded-2xl flex items-center justify-center mx-auto mb-6">
+              <GitBranch className="w-10 h-10 text-blue-600" />
             </div>
+            <h4 className="text-lg font-semibold text-gray-800 mb-3">
+              Dagre Tree Visualization Ready
+            </h4>
+            <p className="text-gray-600 mb-6">
+              Click "Open Canvas View" to explore the complete interaction graph
+              with hierarchical flow trees, organized states, and clear
+              transitions.
+            </p>
+
+            {graph.flows && graph.flows.length > 0 && (
+              <div className="pt-6 border-t">
+                <h5 className="text-sm font-medium text-gray-700 mb-3">
+                  Discovered Flows
+                </h5>
+                <div className="flex flex-wrap gap-2 justify-center">
+                  {graph.flows.map((flow) => {
+                    const colors = getFlowColor(flow.flowType);
+                    return (
+                      <Badge
+                        key={flow.id}
+                        variant="outline"
+                        className="text-sm px-3 py-1"
+                        style={{
+                          backgroundColor: colors.soft + "30",
+                          borderColor: colors.border,
+                          color: colors.border,
+                        }}
+                      >
+                        <Circle
+                          className="w-2 h-2 mr-1.5"
+                          style={{ fill: colors.bg }}
+                        />
+                        {flow.name}
+                        <span className="ml-2 opacity-70">
+                          ({flow.imageNodes.length})
+                        </span>
+                      </Badge>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
           </div>
         </div>
       </div>

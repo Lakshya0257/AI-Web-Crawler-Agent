@@ -4,7 +4,7 @@ import fs from "fs";
 import path from "path";
 import logger from "../../utils/logger.js";
 import { FileManager } from "../storage/FileManager.js";
-import { GlobalStore } from "../storage/GlobalStore.js";
+import { GlobalStore, TreeNode } from "../storage/GlobalStore.js";
 import { LLMClient } from "../llm/LLMClient.js";
 import { ChatAgent, ExplorationCheckpoint, ChatDecision } from "./ChatAgent.js";
 import {
@@ -13,6 +13,7 @@ import {
   ExecutedStep,
 } from "../../types/exploration.js";
 import type { Socket } from "socket.io";
+import Langfuse from "langfuse";
 
 export class WebExplorer {
   protected session: ExplorationSession;
@@ -29,6 +30,8 @@ export class WebExplorer {
   private activeExplorations?: Map<string, WebExplorer>; // Reference to activeExplorations from SocketServer
   private additionalContext?: string;
   private canLogin: boolean;
+  private langfuse: Langfuse;
+  private langfuseTraceId: string;
 
   // 🆕 Chat and Checkpoint System
   private explorationCheckpoint?: ExplorationCheckpoint;
@@ -56,6 +59,11 @@ export class WebExplorer {
     this.activeExplorations = activeExplorations;
     this.additionalContext = additionalContext;
     this.canLogin = canLogin;
+    this.langfuse = new Langfuse();
+    this.langfuseTraceId = `user-${userName}-${objective}-${Date.now()}`;
+    this.langfuse.trace({
+      id: this.langfuseTraceId,
+    });
 
     // Use the provided isExploration boolean instead of detecting from objective
     this.isExplorationObjective = isExploration;
@@ -190,6 +198,8 @@ export class WebExplorer {
 
       await this.processPage(pageData);
     }
+
+    // await this.langfuse.flushAsync();
 
     return await this.finalizeSession(false);
   }
@@ -338,7 +348,13 @@ export class WebExplorer {
         const currentConversationHistory =
           this.globalStore.getConversationHistory(pageData.urlHash);
 
+        // Get incomplete nodes context for actionables/backtrack tools
+        const incompleteNodes = this.globalStore.getActionsFromTree(
+          pageData.urlHash
+        );
+
         const decision = await this.llmClient.decideNextAction(
+          this.langfuseTraceId,
           currentScreenshotBuffer,
           pageData.url,
           this.session.metadata.objective,
@@ -351,7 +367,8 @@ export class WebExplorer {
           maxPagesReached,
           this.session.userInputs,
           this.session.flowContext,
-          this.session.actionHistory
+          this.session.actionHistory,
+          incompleteNodes
         );
 
         // Check if exploration should continue after LLM call
@@ -471,6 +488,195 @@ export class WebExplorer {
             pageData,
             currentScreenshotBuffer
           );
+        } else if (decision.tool_to_use === "actionables") {
+          // Get current page's global store tree and add actionables as children
+          const currentNode = this.globalStore.getCurrentTreeNode(
+            pageData.urlHash
+          );
+          if (currentNode && decision.tool_parameters.actionables) {
+            const actionables = decision.tool_parameters.actionables;
+
+            // Add each actionable as a child node
+            for (const actionable of actionables) {
+              const childId = `${currentNode.id}_actionable_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+              const childNode: TreeNode = {
+                id: childId,
+                completed: false,
+                action: actionable.instruction || `Action: ${actionable.text}`,
+                actionType: actionable.actionType, // Use the actionType from the actionable
+                children: [],
+              };
+
+              currentNode.children.push(childNode);
+            }
+
+            // Save the updated tree structure
+            this.globalStore.saveTreeState(pageData.urlHash);
+
+            logger.info(
+              `📝 Added ${actionables.length} actionables as children to current node`
+            );
+
+            // Move current node to first actionable child and execute its action
+            if (currentNode.children.length > 0) {
+              const firstChild = currentNode.children[0];
+
+              // Update current node to the first child
+              this.globalStore.setCurrentTreeNode(
+                pageData.urlHash,
+                firstChild.id
+              );
+
+              logger.info(
+                `🎯 Moving to first actionable child: ${firstChild.id}`
+              );
+              logger.info(`🎬 Executing action: ${firstChild.action}`);
+
+              // Execute page_act with the first child's action
+              stepResult = await this.executeTool(
+                "page_act",
+                firstChild.action,
+                pageData,
+                currentScreenshotBuffer
+              );
+
+              // Check if page changed after action execution
+              if (stepResult && stepResult.urlChanged) {
+                logger.info(
+                  `🔄 Page change detected, marking current node as completed`
+                );
+
+                // Mark current node as completed
+                this.globalStore.markNodeCompleted(
+                  pageData.urlHash,
+                  firstChild.id
+                );
+
+                // Find next incomplete node using DFS
+                const nextIncompleteNode =
+                  this.globalStore.getNextIncompleteNode(pageData.urlHash);
+
+                if (nextIncompleteNode) {
+                  logger.info(
+                    `🎯 Moving to next incomplete node: ${nextIncompleteNode.id}`
+                  );
+
+                  // Update current node to the next incomplete node
+                  this.globalStore.setCurrentTreeNode(
+                    pageData.urlHash,
+                    nextIncompleteNode.id
+                  );
+
+                  // Reset page state and execute the path to current node
+                  const resetResult = await this.resetPageState(
+                    pageData,
+                    nextIncompleteNode.id
+                  );
+
+                  if (resetResult) {
+                    // Update stepResult to reflect the reset action with only the incomplete state instruction
+                    stepResult = {
+                      ...resetResult,
+                      instruction: nextIncompleteNode.action, // Only the incomplete state action
+                      result: "Action success", // For resetting scenario
+                    };
+                  }
+                } else {
+                  logger.info(`✅ All actionables completed for this page`);
+
+                  // Update stepResult for page change completion
+                  stepResult = {
+                    ...stepResult,
+                    result:
+                      "Page change detected, now system will handle it separately",
+                  };
+                }
+              }
+            }
+          }
+        } else if (decision.tool_to_use === "backtrack") {
+          // Handle backtrack: mark current node as completed and move to next incomplete node
+          const currentNodeId = this.globalStore.getCurrentTreeNodeId(
+            pageData.urlHash
+          );
+
+          if (currentNodeId) {
+            logger.info(
+              `⬅️ Backtrack requested, marking current node as completed: ${currentNodeId}`
+            );
+
+            // Mark current node as completed
+            this.globalStore.markNodeCompleted(pageData.urlHash, currentNodeId);
+
+            // Find next incomplete node using DFS
+            const nextIncompleteNode = this.globalStore.getNextIncompleteNode(
+              pageData.urlHash
+            );
+
+            if (nextIncompleteNode) {
+              logger.info(
+                `🎯 Moving to next incomplete node: ${nextIncompleteNode.id}`
+              );
+
+              // Update current node to the next incomplete node
+              this.globalStore.setCurrentTreeNode(
+                pageData.urlHash,
+                nextIncompleteNode.id
+              );
+
+              // Reset page state and execute the path to current node (backtrack context)
+              const resetResult = await this.resetPageState(
+                pageData,
+                nextIncompleteNode.id,
+                true
+              );
+
+              if (resetResult) {
+                // Update stepResult to reflect the reset action with only the incomplete state instruction
+                stepResult = {
+                  ...resetResult,
+                  instruction: nextIncompleteNode.action, // Only the incomplete state action
+                  result: "Action success", // For resetting scenario
+                };
+              } else {
+                // Fallback if reset failed
+                stepResult = {
+                  step: this.session.globalStepCounter,
+                  timestamp: new Date().toISOString(),
+                  tool_used: "backtrack",
+                  instruction: nextIncompleteNode.action,
+                  success: false,
+                  result: "Reset failed during backtrack",
+                };
+              }
+            } else {
+              logger.info(
+                `✅ All actionables completed for this page - backtrack complete`
+              );
+
+              // Create a simple successful result for backtrack completion
+              stepResult = {
+                step: this.session.globalStepCounter,
+                timestamp: new Date().toISOString(),
+                tool_used: "backtrack",
+                instruction: decision.tool_parameters.instruction,
+                success: true,
+                result: "Backtrack completed - all actionables finished",
+              };
+            }
+          } else {
+            logger.warn(`⚠️ No current node found for backtrack operation`);
+
+            // Create a failed result
+            stepResult = {
+              step: this.session.globalStepCounter,
+              timestamp: new Date().toISOString(),
+              tool_used: "backtrack",
+              instruction: decision.tool_parameters.instruction,
+              success: false,
+              result: "Backtrack failed - no current node found",
+            };
+          }
         } else {
           stepResult = await this.executeTool(
             decision.tool_to_use,
@@ -817,7 +1023,9 @@ export class WebExplorer {
 
         // Customize the system prompt
         instructions: `You are a helpful assistant that can use a web browser.
-	Do not ask follow up questions, the user will trust your judgement. Also only do that action what user have asked, don't do anything else, if user asked to click a button, then only click that button and complete it immediately, dont click or do anything else. JUST FOLLOW THE INSTRUCTIONS.`,
+	Do not ask follow up questions, the user will trust your judgement. Also only do that action what user have asked, don't do anything else, if user asked to click a button, then only click that button and complete it immediately, dont click or do anything else. JUST FOLLOW THE INSTRUCTIONS.
+  If the user asks to hover and hover fails, then try clicking that button. Only for hover instructions, if hover fails, then try clicking that button.
+  `,
 
         // Customize the API key
         options: {
@@ -1214,7 +1422,7 @@ export class WebExplorer {
    * Execute the chosen tool
    */
   private async executeTool(
-    toolName: "page_act" | "user_input" | "standby",
+    toolName: "page_act" | "user_input" | "standby" | "backtrack",
     instruction: string,
     pageData: PageData,
     screenshotBuffer: Buffer,
@@ -1649,6 +1857,8 @@ export class WebExplorer {
       duration: `${duration}ms`,
     });
 
+    await this.langfuse.flushAsync();
+
     return objectiveAchieved;
   }
 
@@ -1676,8 +1886,10 @@ export class WebExplorer {
       // Generate new graph with unified method
       logger.info(`📊 Generating interaction graph for: ${pageStore.url}`);
       const newGraph = await this.llmClient.generateInteractionGraph(
+        this.langfuseTraceId,
         pageStore,
-        currentGraph
+        currentGraph,
+        this.globalStore
       );
 
       if (newGraph) {
@@ -1858,6 +2070,8 @@ export class WebExplorer {
           if (pageData) {
             await this.processPage(pageData);
           }
+
+          // await this.langfuse.flushAsync();
         }
       }
 
@@ -2006,5 +2220,96 @@ export class WebExplorer {
    */
   private shouldContinueExploration(): boolean {
     return !this.isInterrupted && this.isUserStillActive();
+  }
+
+  /**
+   * Reset page state by building a combined command from start to current node
+   * and executing it with page_act
+   */
+  private async resetPageState(
+    pageData: PageData,
+    targetNodeId: string,
+    isBacktrack: boolean = false
+  ) {
+    logger.info(`🔄 Resetting page state to reach node: ${targetNodeId}`);
+
+    try {
+      // Get the path from root to target node
+      const pathToTarget = this.globalStore.getPathToNode(
+        pageData.urlHash,
+        targetNodeId
+      );
+
+      if (pathToTarget.length === 0) {
+        logger.warn(`⚠️ No path found to target node: ${targetNodeId}`);
+        return null;
+      }
+
+      // Build combined command from all actions in the path (excluding root which has no action)
+      const actionCommands: string[] = [];
+      const completedActions: string[] = [];
+
+      for (const node of pathToTarget) {
+        if (node.action && node.action.trim() !== "") {
+          if (node.completed) {
+            completedActions.push(node.action);
+          }
+          actionCommands.push(node.action);
+        }
+      }
+
+      if (actionCommands.length === 0) {
+        logger.warn(
+          `⚠️ No actions found in path to target node: ${targetNodeId}`
+        );
+        return null;
+      }
+
+      // Create smarter instruction based on context
+      let combinedInstruction: string;
+
+      if (isBacktrack && completedActions.length > 0) {
+        // For backtracking: acknowledge current state and provide context
+        const targetAction = pathToTarget[pathToTarget.length - 1].action;
+        const contextActions = actionCommands.slice(0, -1).join(", then ");
+
+        combinedInstruction = `I am currently on a page where these actions have already been performed: [${completedActions.join(", ")}]. Now I need to continue the sequence by performing: ${contextActions}, then ${targetAction}. Please execute this complete sequence while being aware that some initial actions may have already taken effect on the current page state.`;
+      } else {
+        // For normal reset: simple combined instruction
+        combinedInstruction = actionCommands.join(", then ");
+      }
+
+      logger.info(
+        `🎬 Executing ${isBacktrack ? "backtrack-aware" : "combined"} reset command: ${combinedInstruction}`
+      );
+
+      // Take current screenshot for the reset action
+      const resetScreenshotBuffer = await this.page.screenshot({
+        fullPage: false,
+      });
+
+      // Execute the combined command using page_act
+      const resetResult = await this.executeTool(
+        "page_act",
+        combinedInstruction,
+        pageData,
+        resetScreenshotBuffer
+      );
+
+      if (resetResult && resetResult.success) {
+        logger.info(`✅ Page state reset successful`);
+      } else {
+        logger.warn(`⚠️ Page state reset may have failed`);
+      }
+
+      return resetResult;
+    } catch (error) {
+      logger.error(`❌ Error during page state reset:`, {
+        error: error instanceof Error ? error.message : String(error),
+        targetNodeId,
+      });
+
+      return null;
+    }
   }
 }

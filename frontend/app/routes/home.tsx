@@ -1,13 +1,14 @@
 import React, { useState, useEffect, type JSX } from 'react';
 import { useSocket } from '../hooks/useSocket';
 import { NetworkGraph } from '../components/ui/network-graph';
+import { TreeGraph } from '../components/ui/tree-graph';
 import { ChatInterface } from '../components/ui/chat-interface';
 import { 
   Play, Square, Wifi, WifiOff, Eye, Download, MousePointer, 
   Camera, Globe, Clock, CheckCircle, Loader2, ChevronRight,
   ExternalLink, Maximize2, X, AlertCircle, Network, Sparkles,
   FileText, Code, Link2, Activity, Bot, Settings, Info, Database,
-  MessageSquare, ChevronDown, ChevronUp
+  MessageSquare, ChevronDown, ChevronUp, GitBranch
 } from 'lucide-react';
 import { 
   Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter 
@@ -36,7 +37,8 @@ import type {
   PageObserveResult,
   PageActResult,
   URLDiscovery,
-  InteractionGraph
+  InteractionGraph,
+  TreeStructure,
 } from '../types/exploration';
 import { toast } from 'sonner';
 
@@ -57,6 +59,7 @@ interface PersistedData {
   urlDiscoveries: URLDiscovery[];
   pageStatuses: PageStatus[];
   graphs: { [urlHash: string]: InteractionGraph };
+  trees: { [urlHash: string]: TreeStructure };
 }
 
 export default function Home() {
@@ -83,7 +86,8 @@ export default function Home() {
     toolResults: { observe: [], act: [] },
     urlDiscoveries: [],
     pageStatuses: [],
-    graphs: {}
+    graphs: {},
+    trees: {}
   });
   
   const [config, setConfig] = useState<ExplorationConfig>({
@@ -145,6 +149,15 @@ export default function Home() {
       setPersistedData(prev => ({
         ...prev,
         graphs: { ...explorationState.graphs }
+      }));
+    }
+
+    // Persist trees
+    if (Object.keys(explorationState.trees).length > 0) {
+      console.log('Home: Persisting trees:', explorationState.trees);
+      setPersistedData(prev => ({
+        ...prev,
+        trees: { ...explorationState.trees }
       }));
     }
   }, [explorationState]);
@@ -238,6 +251,15 @@ Goal: Map the entire user experience and create detailed interaction graphs for 
   const getPageGraph = (urlHash: string): InteractionGraph | null => {
     const graphs = isRunning ? explorationState.graphs : persistedData.graphs;
     return graphs[urlHash] || null;
+  };
+
+  const getPageTree = (urlHash: string): TreeStructure | null => {
+    const trees = isRunning ? explorationState.trees : persistedData.trees;
+    const tree = trees[urlHash] || null;
+    if (!tree && Object.keys(trees).length > 0) {
+      console.log('Home: Tree not found for urlHash:', urlHash, 'Available:', Object.keys(trees));
+    }
+    return tree;
   };
 
   return (
@@ -514,12 +536,16 @@ Goal: Map the entire user experience and create detailed interaction graphs for 
                   </div>
 
                   {/* Page Content Tabs */}
-                  <Tabs defaultValue="graph" className="flex-1 flex flex-col overflow-hidden">
+                  <Tabs defaultValue="tree" className="flex-1 flex flex-col overflow-hidden">
                     <div className="bg-card px-4 pt-2">
                       <TabsList className="h-8">
                         <TabsTrigger value="graph" className="text-xs data-[state=active]:text-xs">
                           <Network className="w-3 h-3 mr-1" />
                           Graph
+                        </TabsTrigger>
+                        <TabsTrigger value="tree" className="text-xs data-[state=active]:text-xs">
+                          <GitBranch className="w-3 h-3 mr-1" />
+                          Tree
                         </TabsTrigger>
                         <TabsTrigger value="screenshots" className="text-xs data-[state=active]:text-xs">
                           Screenshots
@@ -532,6 +558,38 @@ Goal: Map the entire user experience and create detailed interaction graphs for 
                         </TabsTrigger>
                       </TabsList>
                     </div>
+
+                    {/* Tree Tab */}
+                    <TabsContent value="tree" className="flex-1 overflow-auto p-4">
+                      {(() => {
+                        const tree = getPageTree(selectedPage.urlHash);
+                        
+                        // Debug logging
+                        console.log('Home: Tree tab rendering for urlHash:', selectedPage.urlHash, 'hasTree:', !!tree);
+                        
+                        if (!tree) {
+                          return (
+                            <div className="flex items-center justify-center h-full">
+                              <div className="text-center">
+                                <Network className="w-12 h-12 mx-auto mb-4 text-muted-foreground/50" />
+                                <p className="text-sm text-muted-foreground">
+                                  {selectedPage.status === 'in_progress' 
+                                    ? 'Tree structure is being generated...' 
+                                    : 'No tree structure available for this page yet'
+                                  }
+                                </p>
+                                <div className="mt-4 text-xs text-muted-foreground">
+                                  <p>URL Hash: {selectedPage.urlHash}</p>
+                                  <p>Available trees: {Object.keys(isRunning ? explorationState.trees : persistedData.trees).join(', ')}</p>
+                                </div>
+                              </div>
+                            </div>
+                          );
+                        }
+                        
+                        return <TreeGraph treeStructure={tree} />;
+                      })()}
+                    </TabsContent>
 
                     {/* Graph Tab */}
                     <TabsContent value="graph" className="flex-1 overflow-auto p-4">

@@ -1,4 +1,4 @@
-export { WebExplorer } from './WebExplorer.js';
+export { WebExplorer } from './WebExplorer.js'; 
 export { ChatAgent } from './ChatAgent.js';
 export type { 
   ChatMessage, 

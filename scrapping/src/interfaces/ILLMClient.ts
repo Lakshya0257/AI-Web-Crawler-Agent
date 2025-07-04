@@ -27,7 +27,8 @@ export interface ILLMClient {
     maxPagesReached?: boolean,
     userInputs?: Map<string, any>,
     flowContext?: { isInSensitiveFlow: boolean; flowType?: string },
-    actionHistory?: ActionHistoryEntry[]
+    actionHistory?: ActionHistoryEntry[],
+    incompleteNodes?: string[]
   ): Promise<LLMDecisionResponse | null>;
 
   /**

@@ -36,6 +36,7 @@ const initialState: ExplorationState = {
   activeToolExecution: null,
   userInputRequest: null,
   graphs: {},
+  trees: {},
   chatState: {
     messages: [],
     isActive: false,
@@ -240,6 +241,18 @@ export function useSocket() {
                 ? { ...p, hasGraph: true, graphLastUpdated: update.timestamp }
                 : p
             )
+          };
+
+        case 'tree_updated':
+          console.log('🌳 Tree updated event received:', data);
+          console.log('🌳 Tree structure:', data.treeStructure);
+          console.log('🌳 URL Hash:', data.urlHash);
+          return {
+            ...prev,
+            trees: {
+              ...prev.trees,
+              [data.urlHash]: data.treeStructure
+            }
           };
 
         // New chat events

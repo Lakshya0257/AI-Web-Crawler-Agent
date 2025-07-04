@@ -389,3 +389,4 @@ Based on all the visual context and exploration history above, analyze this requ
     return contexts.join("\n");
   }
 }
+ 

@@ -103,7 +103,9 @@ export class SocketServer {
               inputKeys: Object.keys(data.inputs),
             });
           } else {
-            logger.warn("⚠️ Invalid user input response - no inputs or skip signal");
+            logger.warn(
+              "⚠️ Invalid user input response - no inputs or skip signal"
+            );
           }
           // The input response is automatically handled by the WebExplorer's toolUserInput method
           // which is listening for this event on the same socket
@@ -111,48 +113,48 @@ export class SocketServer {
       );
 
       // 🆕 Handle chat messages from user
-      socket.on(
-        "chat_message",
-        async (data: { userName: string; message: string }) => {
-          console.log("💬 Received chat message", data);
-          try {
-            logger.info("💬 Received chat message", {
-              userName: data.userName,
-              message: data.message.substring(0, 100),
-            });
+      // socket.on(
+      //   "chat_message",
+      //   async (data: { userName: string; message: string }) => {
+      //     console.log("💬 Received chat message", data);
+      //     try {
+      //       logger.info("💬 Received chat message", {
+      //         userName: data.userName,
+      //         message: data.message.substring(0, 100),
+      //       });
 
-            const explorer = this.activeExplorations.get(data.userName);
-            if (explorer && "handleChatMessage" in explorer) {
-              // TypeScript cast to access the handleChatMessage method
-              await (explorer as any).handleChatMessage(data.message);
-            } else {
-              logger.warn("⚠️ No active explorer found for chat message", {
-                userName: data.userName,
-                activeExplorers: Array.from(this.activeExplorations.keys()),
-              });
+      //       const explorer = this.activeExplorations.get(data.userName);
+      //       if (explorer && "handleChatMessage" in explorer) {
+      //         // TypeScript cast to access the handleChatMessage method
+      //         await (explorer as any).handleChatMessage(data.message);
+      //       } else {
+      //         logger.warn("⚠️ No active explorer found for chat message", {
+      //           userName: data.userName,
+      //           activeExplorers: Array.from(this.activeExplorations.keys()),
+      //         });
 
-              socket.emit("chat_error", {
-                userName: data.userName,
-                error:
-                  "No active exploration session found. Please start an exploration first.",
-                timestamp: new Date().toISOString(),
-              });
-            }
-          } catch (error) {
-            console.log("Error in handleChatMessage:", error);
-            logger.error("❌ Failed to handle chat message", {
-              error,
-              userName: data.userName,
-            });
+      //         socket.emit("chat_error", {
+      //           userName: data.userName,
+      //           error:
+      //             "No active exploration session found. Please start an exploration first.",
+      //           timestamp: new Date().toISOString(),
+      //         });
+      //       }
+      //     } catch (error) {
+      //       console.log("Error in handleChatMessage:", error);
+      //       logger.error("❌ Failed to handle chat message", {
+      //         error,
+      //         userName: data.userName,
+      //       });
 
-            socket.emit("chat_error", {
-              userName: data.userName,
-              error: "Failed to process chat message. Please try again.",
-              timestamp: new Date().toISOString(),
-            });
-          }
-        }
-      );
+      //       socket.emit("chat_error", {
+      //         userName: data.userName,
+      //         error: "Failed to process chat message. Please try again.",
+      //         timestamp: new Date().toISOString(),
+      //       });
+      //     }
+      //   }
+      // );
 
       socket.on("disconnect", () => {
         logger.info("🔌 Client disconnected", { socketId: socket.id });

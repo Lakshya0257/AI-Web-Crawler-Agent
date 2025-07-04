@@ -47,7 +47,12 @@ export interface PageData {
 export interface ExecutedStep {
   step: number;
   timestamp: string;
-  tool_used: "page_act" | "page_extract" | "user_input" | "standby";
+  tool_used:
+    | "page_act"
+    | "backtrack"
+    | "user_input"
+    | "standby"
+    | "actionables";
   instruction: string;
   success: boolean;
   result?: string;
@@ -80,7 +85,12 @@ export interface InputRequest {
 // LLM Decision Response
 export interface LLMDecisionResponse {
   reasoning: string;
-  tool_to_use: "page_act" | "user_input" | "standby";
+  tool_to_use:
+    | "page_act"
+    | "user_input"
+    | "standby"
+    | "backtrack"
+    | "actionables";
   tool_parameters: {
     instruction: string;
     // For single input (backward compatibility)
@@ -99,7 +109,19 @@ export interface LLMDecisionResponse {
     inputs?: InputRequest[];
     // For standby tool
     waitTimeSeconds?: number;
+    // For actionables tool
+    actionables?: {
+      text: string;
+      instruction: string;
+      elementType?: string;
+      actionType: "click" | "hover" | "scroll";
+    }[];
   };
+  actions: {
+    id: string;
+    action: string;
+    actionType: "hover" | "click";
+  }[];
   isCurrentPageExecutionCompleted: boolean;
   isInSensitiveFlow?: boolean;
 }

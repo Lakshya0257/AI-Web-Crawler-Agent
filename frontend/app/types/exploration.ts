@@ -92,6 +92,35 @@ export interface FlowDefinition {
   flowType: "linear" | "branching" | "circular"; // Flow pattern type
 }
 
+export interface TreeNode {
+  id: string;
+  completed: boolean;
+  action: string;
+  actionType: "hover" | "click" | "scroll" | "nothing";
+  children: TreeNode[];
+  hasChildren?: boolean;
+  childrenCount?: number;
+  depth?: number;
+}
+
+export interface TreeStructure {
+  timestamp: string;
+  urlHash: string;
+  url: string;
+  currentNodeId: string | null;
+  currentNodePath: TreeNode[];
+  treeStructure: TreeNode;
+  stats: {
+    totalNodes: number;
+    completedNodes: number;
+    incompleteNodes: number;
+    maxDepth: number;
+    actionTypes: Record<string, number>;
+  };
+  incompleteActions: string[];
+  visualTree: string;
+}
+
 export interface GraphNode {
   id: string;
   type:
@@ -224,6 +253,7 @@ export interface ExplorationUpdate {
     | "standby_completed"
     | "updating_graph"
     | "graph_updated"
+    | "tree_updated"
     | "chat_message"
     | "chat_navigation"
     | "chat_error";
@@ -260,6 +290,7 @@ export interface ExplorationState {
   } | null;
   userInputRequest: UserInputRequest | null;
   graphs: { [urlHash: string]: InteractionGraph };
+  trees: { [urlHash: string]: TreeStructure };
   chatState: ChatState;
   isGraphUpdating: boolean;
 }

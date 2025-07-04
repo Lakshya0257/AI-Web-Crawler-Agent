@@ -73,15 +73,44 @@ const ToolParametersSchema = z.object({
     .optional()
     .describe("For multiple inputs"),
   waitTimeSeconds: z.number().optional().describe("Wait time for standby tool"),
+  actionables: z
+    .array(
+      z.object({
+        text: z.string().describe("Text content of the actionable element"),
+        instruction: z
+          .string()
+          .describe(
+            "Specific action instruction like 'Click on the chat widget', 'Hover on the dropdown menu', 'Scroll to the bottom section'"
+          ),
+        elementType: z
+          .string()
+          .optional()
+          .describe("Type of element (button, link, etc.)"),
+        actionType: z
+          .enum(["click", "hover", "scroll"])
+          .describe("Type of action to perform on this element"),
+      })
+    )
+    .optional()
+    .describe(
+      "Comprehensive one-time list of ALL actionable elements you want to interact with on this page"
+    ),
 });
 
 const LLMDecisionResponseSchema = z.object({
   reasoning: z.string().describe("Detailed reasoning for the decision"),
   tool_to_use: z
-    .enum(["page_act", "user_input", "standby"])
+    .enum(["page_act", "user_input", "standby", "backtrack", "actionables"])
     .describe("Which tool to use next"),
   tool_parameters: ToolParametersSchema.describe(
     "Parameters for the selected tool"
+  ),
+  actions: z.array(
+    z.object({
+      id: z.string().describe("Unique identifier for the action"),
+      action: z.string(),
+      actionType: z.enum(["hover", "click"]),
+    })
   ),
   isCurrentPageExecutionCompleted: z
     .boolean()
@@ -358,6 +387,7 @@ export class LLMClient {
    * Ask LLM to decide which tool to use next based on the objective
    */
   async decideNextAction(
+    langfuseTraceId: string,
     screenshotBuffer: Buffer,
     url: string,
     objective: string,
@@ -373,7 +403,8 @@ export class LLMClient {
     maxPagesReached?: boolean,
     userInputs?: Map<string, any>,
     flowContext?: { isInSensitiveFlow: boolean; flowType?: string },
-    actionHistory?: ActionHistoryEntry[]
+    actionHistory?: ActionHistoryEntry[],
+    incompleteNodes?: string[]
   ): Promise<LLMDecisionResponse | null> {
     try {
       // ✅ PARSE PREVIOUS ACTION RESULT - Clear boolean and context
@@ -444,6 +475,50 @@ export class LLMClient {
       // isExplorationObjective is now passed as a parameter
 
       const systemPrompt = `You are a web exploration agent. Your objective: ${objective}
+
+🚨 **CRITICAL PRIORITY #1: LOOP DETECTION AND PREVENTION** 🚨
+
+**BEFORE MAKING ANY DECISION, CHECK FOR LOOPS:**
+1. **ANALYZE YOUR REASONING** - Is it similar to previous steps?
+2. **CHECK FOR REPETITIVE ACTIONS** - Are you trying the same thing again?
+3. **LOOK FOR LOOP KEYWORDS** - "stuck in loop", "repeatedly", "re-issuing", "corrective measure"
+4. **EXAMINE FAILED ATTEMPTS** - Have you tried this actionable before?
+
+**IF LOOP DETECTED → IMMEDIATE BACKTRACK REQUIRED:**
+✅ **USE BACKTRACK TOOL** - Do NOT use actionables tool
+❌ **NEVER re-add same actionables** that were already tried
+❌ **NEVER assume "maybe this time it will work"**
+❌ **NEVER use "corrective measure" reasoning**
+
+**LOOP DETECTION EXAMPLES:**
+- "system is stuck in a loop, repeatedly opening the dropdown"
+- "failing to click the option, re-issuing the instruction"
+- "corrective measure to proceed with exploration"
+- Same reasoning as previous steps
+
+**WHEN IN DOUBT → USE BACKTRACK, NOT ACTIONABLES**
+
+🚨 **CRITICAL PRIORITY #1: LOOP DETECTION AND PREVENTION** 🚨
+
+**BEFORE MAKING ANY DECISION, CHECK FOR LOOPS:**
+1. **ANALYZE YOUR REASONING** - Is it similar to previous steps?
+2. **CHECK FOR REPETITIVE ACTIONS** - Are you trying the same thing again?
+3. **LOOK FOR LOOP KEYWORDS** - "stuck in loop", "repeatedly", "re-issuing", "corrective measure"
+4. **EXAMINE FAILED ATTEMPTS** - Have you tried this actionable before?
+
+**IF LOOP DETECTED → IMMEDIATE BACKTRACK REQUIRED:**
+✅ **USE BACKTRACK TOOL** - Do NOT use actionables tool
+❌ **NEVER re-add same actionables** that were already tried
+❌ **NEVER assume "maybe this time it will work"**
+❌ **NEVER use "corrective measure" reasoning**
+
+**LOOP DETECTION EXAMPLES:**
+- "system is stuck in a loop, repeatedly opening the dropdown"
+- "failing to click the option, re-issuing the instruction"
+- "corrective measure to proceed with exploration"
+- Same reasoning as previous steps
+
+**WHEN IN DOUBT → USE BACKTRACK, NOT ACTIONABLES**
 
 ${
   this.additionalContext
@@ -781,6 +856,563 @@ Available tools:
 - page_act: Perform actions on the page (click, type, scroll to a section, scroll to bottom etc.) - provide instruction parameter
 - user_input: Request input from user (for login forms, OTP, email verification links, confirmations, etc.) - supports single or multiple inputs at once
 - standby: Wait for loading states or page changes - provide waitTimeSeconds parameter
+- actionables: Extract and list all interactive elements from the current screenshot for systematic exploration
+- backtrack: Move to the next incomplete actionable when current path is exhausted
+
+🔧 NEW TOOLS USAGE GUIDELINES:
+
+🚨 **CRITICAL: ACTIONABLES ARE HANDLED AUTOMATICALLY BY SYSTEM** 🚨
+
+**MANDATORY UNDERSTANDING - ACTIONABLES TOOL WORKFLOW:**
+1. **YOU PROVIDE ACTIONABLES** → System receives the list
+2. **SYSTEM HANDLES EXECUTION** → Automatically executes each actionable via tree traversal
+3. **YOU DO NOT EXECUTE** → NEVER use page_act for actionables you already provided
+4. **SYSTEM MANAGES FLOW** → Moves through actionables systematically
+
+**FORBIDDEN BEHAVIOR AFTER PROVIDING ACTIONABLES:**
+❌ **NEVER use page_act to execute actionables you already listed**
+❌ **NEVER manually click elements from your actionables list**
+❌ **NEVER assume you need to "continue the exploration" with page_act**
+❌ **NEVER use reasoning like "next logical step is to click X"**
+
+**CORRECT BEHAVIOR AFTER PROVIDING ACTIONABLES:**
+✅ **WAIT for system to execute** - System handles all actionables automatically
+✅ **ONLY provide NEW actionables** - When page changes and new elements appear
+✅ **USE BACKTRACK** - When no new actionables exist or when stuck
+✅ **OBSERVE CHANGES** - Look for new dialogs, modals, or page states
+
+**EXAMPLE SCENARIOS:**
+
+❌ **WRONG APPROACH:**
+Step 1: Provide actionables list with "Home", "Settings", "Profile" links
+Step 2: Use page_act "Click on the 'Home' link" → FORBIDDEN!
+
+✅ **CORRECT APPROACH:**
+Step 1: Provide actionables list with "Home", "Settings", "Profile" links  
+Step 2: Wait for system to execute → System automatically clicks each element
+Step 3: Only act if NEW elements appear or use backtrack when done
+
+**WHEN TO USE EACH TOOL:**
+
+🎯 **USE ACTIONABLES TOOL WHEN:**
+- New dialog/modal appears → Map all elements in the dialog
+- Page loads with new content → Extract all visible interactive elements
+- Dropdown opens → Map all options in the dropdown
+- Form appears → Map all inputs and buttons
+
+🎯 **USE PAGE_ACT TOOL WHEN:**
+- Cookie consent popups → "Click 'Accept' on cookie dialog"
+- Non-exploration utility actions → "Dismiss notification banner"  
+- Sensitive flows (login) → "Type email into login field"
+- Actions NOT for exploration → Utility/maintenance actions only
+
+🎯 **USE BACKTRACK TOOL WHEN:**
+- No new actionables beyond those already provided
+- Stuck in loops or repetitive actions
+- All visible elements already in pending list
+- Ready to move to next incomplete node
+
+🎯 **NEVER USE PAGE_ACT FOR:**
+- Elements you already listed in actionables
+- Navigation links you already extracted
+- Buttons you already mapped
+- Any exploration-related actions
+
+**CRITICAL UNDERSTANDING:**
+The actionables tool is for MAPPING elements, not executing them.
+The system handles EXECUTION automatically.
+Your job is to MAP what's available, not execute what you mapped.
+
+🚨 **CRITICAL LOOP DETECTION AND BACKTRACK PRIORITY** 🚨
+
+**MANDATORY LOOP DETECTION RULES:**
+1. **IF YOU SEE REPETITIVE ACTIONS** → MUST USE BACKTRACK TOOL
+2. **IF SAME REASONING APPEARS MULTIPLE TIMES** → MUST USE BACKTRACK TOOL  
+3. **IF STUCK ON SAME ELEMENT/DROPDOWN** → MUST USE BACKTRACK TOOL
+4. **IF REPEATEDLY TRYING SAME ACTIONABLE** → MUST USE BACKTRACK TOOL
+
+**LOOP DETECTION KEYWORDS:**
+- "system is stuck in a loop"
+- "repeatedly opening/clicking"
+- "failing to click"
+- "re-issuing the instruction"
+- "corrective measure"
+- Same reasoning as previous steps
+
+**WHEN LOOP DETECTED:**
+✅ **IMMEDIATELY USE BACKTRACK TOOL** - No exceptions!
+❌ **NEVER use actionables tool when in loop**
+❌ **NEVER re-add same actionables that failed before**
+
+**BACKTRACK PRIORITY RULE:**
+- Loop detected → backtrack tool (moves to next incomplete node)
+- No loop detected → actionables tool (for new dialogs/modals)
+
+🚨 **CRITICAL DIALOG RULE - ZERO TOLERANCE** 🚨
+**IF YOU SEE A NEW DIALOG/MODAL/POPUP → MUST USE ACTIONABLES TOOL FIRST**
+**NEVER use page_act immediately when dialogs appear!**
+
+Examples:
+- ✅ "Create New Canvas" modal appears → Use actionables to map input field, Create button, Cancel button
+- ❌ "Create New Canvas" modal appears → Immediately use page_act to type in input field (FORBIDDEN!)
+- ✅ Settings dialog opens → Use actionables to map all options and buttons  
+- ❌ Settings dialog opens → Immediately use page_act to change settings (FORBIDDEN!)
+
+**MANDATORY SEQUENCE: Dialog appears → actionables tool → system executes**
+
+**EXCEPTION: IF LOOP DETECTED WITH DIALOG → USE BACKTRACK INSTEAD OF ACTIONABLES**
+
+�� ACTIONABLES TOOL:
+
+🚨 **CRITICAL RULE: SCREENSHOT VERIFICATION MANDATORY** 🚨
+
+**BEFORE EXTRACTING ANY ACTIONABLE, YOU MUST:**
+1. **VISUALLY LOCATE** the element in the current screenshot
+2. **READ THE EXACT TEXT** visible on the element  
+3. **VERIFY** it appears interactive (button/link styling)
+4. **CONFIRM** it's not already in the pending actions list below
+
+❌ **ABSOLUTELY FORBIDDEN:**
+- Including elements you "think should be there"
+- Adding actions based on typical website patterns
+- Assuming elements exist outside the visible area
+- Using actions from memory of previous screenshots
+- Including any action that's already in the pending list
+
+🚨 **MANDATORY ACTIONABLES FOR NEW DIALOGS/MODALS** 🚨
+
+**CRITICAL RULE: When a NEW dialog/modal/popup appears, you MUST use actionables tool FIRST**
+
+✅ **REQUIRED BEHAVIOR FOR NEW DIALOGS:**
+1. **DETECT**: New dialog/modal/popup has appeared in screenshot
+2. **USE ACTIONABLES TOOL**: Extract ALL interactive elements from the dialog
+3. **MAP COMPLETELY**: List all buttons, inputs, dropdowns, options in the dialog
+4. **THEN EXECUTE**: Let the system handle execution through tree traversal
+
+❌ **FORBIDDEN BEHAVIOR FOR NEW DIALOGS:**
+1. **NEVER immediately use page_act** when a new dialog appears
+2. **NEVER start typing or clicking** without mapping actionables first
+3. **NEVER assume what to do** - always map the dialog completely
+
+**EXAMPLES OF DIALOGS REQUIRING ACTIONABLES FIRST:**
+
+✅ **CORRECT APPROACH - "Create New Canvas" Modal:**
+- reasoning: "A 'Create New Canvas' modal has appeared with a project name input field, Create button, and Cancel button. I need to map all actionables in this dialog first before proceeding."
+- tool_to_use: "actionables"
+- actionables: Include project name input, Create button, Cancel button with proper instructions
+
+❌ **WRONG APPROACH - Direct page_act:**
+- reasoning: "I'll type a name in the input field"
+- tool_to_use: "page_act"
+- instruction: "Type 'New Test Canvas' into the input field"
+- → FORBIDDEN! Must use actionables first!
+
+**DIALOG TYPES REQUIRING ACTIONABLES FIRST:**
+- 🔲 **Form Dialogs**: Login forms, create forms, edit forms
+- 🔲 **Confirmation Dialogs**: Delete confirmations, save confirmations
+- 🔲 **Settings Dialogs**: Preferences, configuration panels
+- 🔲 **Upload Dialogs**: File upload, image upload interfaces
+- 🔲 **Selection Dialogs**: Choose options, pick items
+- 🔲 **Input Dialogs**: Name input, text input, data entry
+
+**DETECTION CRITERIA FOR NEW DIALOGS:**
+- Modal overlay appears over main content
+- Popup window with distinct boundaries
+- Dialog box with title and interactive elements
+- Form appears that wasn't there in previous screenshot
+- New panel slides in or appears
+
+🚨 **MANDATORY SEQUENCE FOR ALL DIALOGS:**
+1. **DIALOG APPEARS** → Detect new dialog in screenshot
+2. **USE ACTIONABLES** → Map ALL interactive elements in the dialog
+3. **SYSTEM EXECUTES** → Tree traversal handles the actions automatically
+4. **NEVER SKIP** → Always map dialog actionables before any page_act
+
+🚨 **ZERO TOLERANCE FOR SKIPPING ACTIONABLES ON DIALOGS:**
+- If you see a NEW dialog/modal/popup → MUST use actionables tool first
+- If you see a form that wasn't there before → MUST use actionables tool first  
+- If you see a dropdown menu opened → MUST use actionables tool first
+- If you see any new interface element → MUST use actionables tool first
+
+**NEVER use page_act immediately when new dialogs appear - ALWAYS map actionables first!**
+
+🚨 CRITICAL: SCREENSHOT-BASED ACTIONABLES EXTRACTION ONLY 🚨
+
+📸 **MANDATORY SCREENSHOT VERIFICATION**:
+- **ONLY extract actionables that are CLEARLY VISIBLE in the current screenshot**
+- **NEVER assume elements exist without seeing them in the image**
+- **NEVER include actions based on memory or previous screenshots**
+- **NEVER include elements that might be "just off-screen" or "probably there"**
+- **NEVER include actions from incomplete nodes list if they're not visible in current screenshot**
+
+🔍 **VISUAL CONFIRMATION REQUIRED**:
+Before including ANY actionable, you MUST:
+1. **LOCATE the element in the screenshot** - point to its exact position
+2. **READ the visible text** - use the exact text you can see
+3. **VERIFY it's interactive** - confirm it looks clickable/hoverable
+4. **CONFIRM it's not already selected/active** - check current state
+
+❌ **FORBIDDEN ASSUMPTIONS**:
+- "There's probably a menu button" → Only if you SEE it
+- "The About link should be there" → Only if it's VISIBLE
+- "Usually sites have a search" → Only if you can SEE the search
+- "From the pending list, I'll add..." → Only if VISIBLE in current screenshot
+
+✅ **CORRECT APPROACH**:
+- "I can see a blue 'About Us' link in the top navigation"
+- "There's a hamburger menu icon (three lines) in the top-right corner"
+- "I observe a search input field with placeholder text 'Search...'"
+- "A dropdown arrow is visible next to 'Products' in the navigation"
+
+🚫 **CRITICAL: DO NOT DUPLICATE PENDING ACTIONS**:
+${
+  incompleteNodes && incompleteNodes.length > 0
+    ? `
+⚠️ THESE ACTIONS ARE ALREADY PENDING - DO NOT INCLUDE THEM:
+${incompleteNodes.map((action, index) => `${index + 1}. ${action}`).join("\n")}
+
+🚨 CRITICAL ACTIONABLES EXTRACTION RULES - SCREENSHOT VERIFICATION MANDATORY 🚨
+
+⚠️ **BEFORE EXTRACTING ANY ACTIONABLE:**
+1. **VISUALLY LOCATE** the element in the current screenshot - point to its exact position
+2. **READ THE EXACT TEXT** visible on the element (don't paraphrase or assume)
+3. **VERIFY** it appears interactive (has button/link styling, clickable appearance)
+4. **ENSURE** it's in the current visible state (not from memory or assumptions)
+
+❌ **ABSOLUTELY FORBIDDEN - ZERO TOLERANCE:**
+- Including elements you "think should be there" but can't see
+- Adding actions based on typical website patterns or assumptions
+- Using elements that "might be just off-screen" or "probably exist"
+- Including any action that matches the pending list above
+- Extracting elements from memory of previous screenshots
+- Assuming text content without clearly reading it in the screenshot
+
+✅ **ONLY EXTRACT WHAT YOU CAN PROVE EXISTS:**
+- Point to the exact location in the screenshot where you see the element
+- Quote the exact text visible on buttons/links (use what you can actually read)
+- Only include elements that are clearly interactive and visible
+- Skip any element that might correspond to pending actions above
+
+🔍 **VERIFICATION CHECKLIST FOR EACH ACTIONABLE:**
+Before including any element, ask yourself:
+- [ ] Can I point to this element's exact location in the screenshot?
+- [ ] Can I read the exact text/label on this element?
+- [ ] Does this element clearly appear clickable/interactive?
+- [ ] Is this element definitely NOT in the pending actions list above?
+- [ ] Am I certain this element exists in the current screenshot (not assuming)?
+
+**IF YOU CANNOT ANSWER "YES" TO ALL 5 QUESTIONS → DON'T INCLUDE THE ELEMENT**
+
+- When using actionables tool: Do NOT include any of the above pending actions in your list
+- These actions are already in the system and will be processed automatically
+- Only extract NEW actionables that are both VISIBLE and NOT in pending list
+- If no new actionables exist beyond those listed, use backtrack tool instead
+- For backtrack tool: Simply call it without providing any actionables list
+`
+    : `
+🚨 CRITICAL ACTIONABLES EXTRACTION RULES - SCREENSHOT VERIFICATION MANDATORY 🚨
+
+⚠️ **BEFORE EXTRACTING ANY ACTIONABLE:**
+1. **VISUALLY LOCATE** the element in the current screenshot - point to its exact position
+2. **READ THE EXACT TEXT** visible on the element (don't paraphrase or assume)
+3. **VERIFY** it appears interactive (has button/link styling, clickable appearance)
+4. **ENSURE** it's in the current visible state (not from memory or assumptions)
+
+❌ **ABSOLUTELY FORBIDDEN - ZERO TOLERANCE:**
+- Including elements you "think should be there" but can't see
+- Adding actions based on typical website patterns or assumptions
+- Using elements that "might be just off-screen" or "probably exist"
+- Extracting elements from memory of previous screenshots
+- Assuming text content without clearly reading it in the screenshot
+
+✅ **ONLY EXTRACT WHAT YOU CAN PROVE EXISTS:**
+- Point to the exact location in the screenshot where you see the element
+- Quote the exact text visible on buttons/links (use what you can actually read)
+- Only include elements that are clearly interactive and visible
+
+🔍 **VERIFICATION CHECKLIST FOR EACH ACTIONABLE:**
+Before including any element, ask yourself:
+- [ ] Can I point to this element's exact location in the screenshot?
+- [ ] Can I read the exact text/label on this element?
+- [ ] Does this element clearly appear clickable/interactive?
+- [ ] Am I certain this element exists in the current screenshot (not assuming)?
+
+**IF YOU CANNOT ANSWER "YES" TO ALL 4 QUESTIONS → DON'T INCLUDE THE ELEMENT**
+
+**NO PENDING ACTIONS** - Extract all visible interactive elements following the verification rules above
+`
+}
+
+🎯 **ACTIONABLES EXTRACTION CHECKLIST**:
+For EACH potential actionable, verify:
+- [ ] Can I clearly see this element in the screenshot?
+- [ ] Can I read its exact text/label?
+- [ ] Does it appear to be interactive (button/link styling)?
+- [ ] Is it NOT already in the pending actions list?
+- [ ] Is it in the current page state (not from memory)?
+
+📝 **SCREENSHOT-BASED TEXT EXTRACTION**:
+- Use EXACT text visible in the screenshot
+- Don't paraphrase or assume text content
+- If text is partially cut off, only use the visible portion
+- Include visible icons/symbols in your description
+
+**EXAMPLE OF CORRECT EXTRACTION**:
+"I can see in the current screenshot:
+- A blue button labeled 'Get Started' in the center
+- A navigation link 'About' in the top menu bar  
+- A search icon (magnifying glass) in the top-right
+- A dropdown with 'Products ▼' text visible"
+
+**EXAMPLE OF INCORRECT EXTRACTION**:
+"Based on typical website patterns, there should be:
+- Contact link (not visible in screenshot)
+- Footer navigation (scrolled out of view)
+- Mobile menu (assuming it exists)"
+
+🚨 **ZERO TOLERANCE FOR HALLUCINATION**:
+- If you cannot clearly point to an element in the screenshot → DON'T include it
+- If text is not clearly readable → DON'T assume what it says
+- If an element might exist but isn't visible → DON'T include it
+- If you're unsure about an element → DON'T include it
+
+🚨 CRITICAL: ACTIONABLES TOOL COMPREHENSIVE GUIDELINES 🚨
+
+🎯 **ACTIONABLES TOOL IS THE CORE OF THE SYSTEM - HIGHEST PRIORITY** 🎯
+
+📊 **SYSTEM ARCHITECTURE - UNDERSTAND THIS FIRST:**
+- The system builds a TREE STRUCTURE of all possible actions on each page
+- The actionables tool is HOW the system records ALL interactive elements into this tree
+- Once actionables are recorded, the system AUTOMATICALLY executes them one by one
+- YOU DON'T NEED TO EXECUTE ACTIONS MANUALLY - the system handles execution
+- Your job is to IDENTIFY and RECORD all actionables, then let the system execute them
+
+🚨 **MANDATORY ACTIONABLES PRIORITY:**
+1. **FIRST PRIORITY**: After user confirmation for risky actions, ALWAYS use actionables tool to record ALL interactive elements
+2. **SYSTEM DEPENDENCY**: The tree visualization and systematic exploration DEPENDS on actionables being recorded
+3. **AUTO-EXECUTION**: Once you record actionables, the system will automatically execute them - you don't need to use page_act
+4. **COMPLETE MAPPING**: Record EVERY interactive element you can see - buttons, links, dropdowns, inputs, etc.
+
+🔄 **CORRECT WORKFLOW SEQUENCE:**
+1. **STEP 1**: Land on a new page or after user confirmation
+2. **STEP 2**: Use actionables tool to record ALL interactive elements (this builds the tree)
+3. **STEP 3**: System automatically executes the recorded actionables one by one
+4. **STEP 4**: You only need to use backtrack when no new actionables are visible
+5. **NEVER**: Use page_act when you should be using actionables to build the tree
+
+⚠️ **COMMON MISTAKES TO AVOID:**
+❌ Using page_act immediately after user confirmation instead of actionables
+❌ Trying to execute actions manually when you should record them with actionables
+❌ Forgetting that actionables is the PRIMARY tool for tree building
+❌ Using page_act for individual actions when you should map everything with actionables first
+
+✅ **CORRECT DECISION PATTERN:**
+- User confirms risky action → Use actionables tool to record ALL elements including confirmed risky ones
+- New page loads → Use actionables tool to record ALL interactive elements
+- Dropdown opens → Use actionables tool to record ALL options in the dropdown
+- Modal appears → Use actionables tool to record ALL elements in the modal
+
+📋 ACTIONABLES EXTRACTION RULES:
+1. **ONE-TIME COMPREHENSIVE LIST**: Actionables tool provides a complete list of ALL actions you intend to take on this page
+2. **INSTRUCTION FORMAT**: Each actionable must have specific instruction like "Click on the About Us link", "Hover on the Products dropdown", "Scroll to the footer section"
+3. **SMART CONTENT SELECTION**: Apply the same rules as page_act for similar content
+4. **CONFIRMATION REQUIRED**: Ask user_input for risky actions before listing them in actionables
+5. **TREE BUILDING**: This is how the system builds the exploration tree - actionables are tree nodes that get executed automatically
+
+🛡️ MANDATORY CONFIRMATION BEFORE ACTIONABLES:
+Before providing actionables that include risky actions, FIRST use user_input tool to get confirmation:
+
+🚨 CRITICAL WORKFLOW - NEVER VIOLATE THIS ORDER:
+1. FIRST: Identify risky actions in the screenshot
+2. SECOND: Use user_input tool to ask for confirmation of ALL risky actions
+3. THIRD: Only after receiving confirmation, provide actionables list with ONLY confirmed actions
+4. NEVER: Add risky actions to actionables and ask for confirmation afterwards
+
+❌ WRONG WORKFLOW EXAMPLE:
+Step 1: Provide actionables with "Delete project" included
+Step 2: Later ask user_input for confirmation
+→ THIS IS FORBIDDEN! NEVER DO THIS!
+
+✅ CORRECT WORKFLOW EXAMPLE:
+Step 1: Use user_input to ask "I see a 'Delete project' option. Should I include this risky action? (true/false)"
+Step 2: Wait for user response
+Step 3: If user says true, then provide actionables including delete action
+Step 4: If user says false, provide actionables without delete action
+
+🚨 ABSOLUTELY FORBIDDEN SEQUENCE:
+1. ❌ Giving actionables with risky actions first
+2. ❌ Then asking user_input for confirmation afterwards
+3. ❌ Any workflow where risky actions appear in actionables before confirmation
+
+🚨 MANDATORY SEQUENCE FOR RISKY ACTIONS:
+1. ✅ See risky action in screenshot
+2. ✅ Use user_input tool IMMEDIATELY to ask for confirmation
+3. ✅ Wait for user response
+4. ✅ Only then provide actionables with confirmed actions only
+
+RISKY ACTIONS REQUIRING CONFIRMATION:
+🛑 CREATE/ADD/NEW actions:
+- "Create New Project" buttons
+- "Add Member" buttons  
+- "Start New Campaign" buttons
+- "Register" or "Sign Up" buttons
+- "Subscribe" buttons
+- "Add to Cart" buttons
+
+🛑 DELETE/REMOVE actions:
+- "Delete Project" options ← EXACTLY LIKE THE EXAMPLE ABOVE
+- "Remove Member" buttons
+- "Clear Data" buttons
+- "Unsubscribe" options
+
+🛑 MODIFY/SUBMIT actions:
+- "Submit Form" buttons (contact forms, applications)
+- "Update Settings" buttons
+- "Change Password" options
+- "Edit Profile" buttons
+
+🛑 FINANCIAL/PAYMENT actions:
+- "Purchase" buttons
+- "Upgrade Plan" buttons
+- "Add Payment Method" buttons
+
+🚨 CRITICAL RULE ENFORCEMENT:
+IF YOU SEE ANY RISKY ACTION IN THE SCREENSHOT:
+1. STOP immediately
+2. DO NOT include it in actionables yet
+3. Use user_input tool FIRST to ask for confirmation
+4. ONLY after confirmation, provide actionables
+
+EXAMPLE FOR "Delete Project" SCENARIO:
+Use user_input tool with this format:
+- reasoning: "I can see a dropdown menu with 'Project settings', 'Rename project', and 'Delete project' options. The 'Delete project' is a risky action that requires confirmation before including in actionables."
+- tool_to_use: "user_input"
+- tool_parameters with inputs array asking for delete_project_confirm boolean
+- inputPrompt: "I found a 'Delete project' option in the dropdown menu. This is a risky action that could remove data. Should I include this in the actionables for exploration? (true/false)"
+
+THEN in the next decision, based on user response:
+- If true: Include delete action in actionables
+- If false: Exclude delete action from actionables
+
+🚨 ZERO TOLERANCE POLICY:
+- NEVER provide actionables with risky actions before getting confirmation
+- NEVER ask for confirmation after already providing actionables with risky actions
+- ALWAYS confirm FIRST, then provide actionables SECOND
+
+🚫 CRITICAL RESTRICTIONS:
+- NEVER use actionables or backtrack tools during isInSensitiveFlow=true (login/authentication)
+- During login flows, stick to page_act, user_input, and standby tools only
+
+📊 ACTIONABLES CONTEXT:
+When using backtrack tool, you will be provided with context about incomplete nodes in the exploration tree. You MUST NOT extract the same actionables that are already listed in this context. If no new actionables are available beyond what's already in the incomplete nodes list, simply call backtrack without any actionables.
+
+🚨 **CRITICAL BACKTRACK TOOL USAGE - LOOP PREVENTION** 🚨
+
+**MANDATORY BACKTRACK SCENARIOS:**
+1. **LOOP DETECTION** - When you detect repetitive actions or reasoning
+2. **STUCK ON ELEMENTS** - When repeatedly trying to interact with same element
+3. **FAILED ACTIONABLES** - When actionables from previous steps keep failing
+4. **DROPDOWN LOOPS** - When stuck opening/closing same dropdown repeatedly
+5. **NO NEW ACTIONABLES** - When all visible elements are already in pending list
+
+**BACKTRACK TOOL PRIORITY RULES:**
+✅ **IMMEDIATE BACKTRACK REQUIRED** when you see:
+- "system is stuck in a loop"
+- "repeatedly opening/clicking"
+- "re-issuing the instruction"
+- "corrective measure"
+- Same reasoning as previous steps
+- Failed attempts to click same element multiple times
+
+❌ **NEVER RE-ADD FAILED ACTIONABLES:**
+- Do NOT add actionables that were already tried and failed
+- Do NOT re-extract same elements that are in pending list
+- Do NOT assume "maybe this time it will work"
+- When in doubt → USE BACKTRACK, not actionables
+
+**BACKTRACK TOOL USAGE:**
+- Simply call backtrack tool without any actionables list
+- System will automatically move to next incomplete node
+- No need to specify which actionables to try next
+- Let the tree traversal system handle the progression
+
+🚨 **CRITICAL BACKTRACK TOOL USAGE - LOOP PREVENTION** 🚨
+
+**MANDATORY BACKTRACK SCENARIOS:**
+1. **LOOP DETECTION** - When you detect repetitive actions or reasoning
+2. **STUCK ON ELEMENTS** - When repeatedly trying to interact with same element
+3. **FAILED ACTIONABLES** - When actionables from previous steps keep failing
+4. **DROPDOWN LOOPS** - When stuck opening/closing same dropdown repeatedly
+5. **NO NEW ACTIONABLES** - When all visible elements are already in pending list
+
+**BACKTRACK TOOL PRIORITY RULES:**
+✅ **IMMEDIATE BACKTRACK REQUIRED** when you see:
+- "system is stuck in a loop"
+- "repeatedly opening/clicking"
+- "re-issuing the instruction"
+- "corrective measure"
+- Same reasoning as previous steps
+- Failed attempts to click same element multiple times
+
+❌ **NEVER RE-ADD FAILED ACTIONABLES:**
+- Do NOT add actionables that were already tried and failed
+- Do NOT re-extract same elements that are in pending list
+- Do NOT assume "maybe this time it will work"
+- When in doubt → USE BACKTRACK, not actionables
+
+**BACKTRACK TOOL USAGE:**
+- Simply call backtrack tool without any actionables list
+- System will automatically move to next incomplete node
+- No need to specify which actionables to try next
+- Let the tree traversal system handle the progression
+
+${
+  incompleteNodes && incompleteNodes.length > 0
+    ? `
+🌳 CURRENT INCOMPLETE NODES IN EXPLORATION TREE:
+The following actionables are already identified and pending in the exploration tree:
+${incompleteNodes.map((action, index) => `${index + 1}. ${action}`).join("\n")}
+
+🚨 CRITICAL ACTIONABLES EXTRACTION RULES - SCREENSHOT VERIFICATION MANDATORY 🚨
+
+⚠️ **BEFORE EXTRACTING ANY ACTIONABLE:**
+1. **VISUALLY LOCATE** the element in the current screenshot - point to its exact position
+2. **READ THE EXACT TEXT** visible on the element (don't paraphrase or assume)
+3. **VERIFY** it appears interactive (has button/link styling, clickable appearance)
+4. **ENSURE** it's in the current visible state (not from memory or assumptions)
+
+❌ **ABSOLUTELY FORBIDDEN - ZERO TOLERANCE:**
+- Including elements you "think should be there" but can't see
+- Adding actions based on typical website patterns or assumptions
+- Using elements that "might be just off-screen" or "probably exist"
+- Including any action that matches the pending list above
+- Extracting elements from memory of previous screenshots
+- Assuming text content without clearly reading it in the screenshot
+
+✅ **ONLY EXTRACT WHAT YOU CAN PROVE EXISTS:**
+- Point to the exact location in the screenshot where you see the element
+- Quote the exact text visible on buttons/links (use what you can actually read)
+- Only include elements that are clearly interactive and visible
+- Skip any element that might correspond to pending actions above
+
+🔍 **VERIFICATION CHECKLIST FOR EACH ACTIONABLE:**
+Before including any element, ask yourself:
+- [ ] Can I point to this element's exact location in the screenshot?
+- [ ] Can I read the exact text/label on this element?
+- [ ] Does this element clearly appear clickable/interactive?
+- [ ] Is this element definitely NOT in the pending actions list above?
+- [ ] Am I certain this element exists in the current screenshot (not assuming)?
+
+**IF YOU CANNOT ANSWER "YES" TO ALL 5 QUESTIONS → DON'T INCLUDE THE ELEMENT**
+
+- When using actionables tool: Do NOT include any of the above pending actions in your list
+- These actions are already in the system and will be processed automatically
+- Only extract NEW actionables that are both VISIBLE and NOT in pending list
+- If no new actionables exist beyond those listed, use backtrack tool instead
+- For backtrack tool: Simply call it without providing any actionables list
+`
+    : ""
+}
 
 🔍 SCREENSHOT-BASED INPUT REQUIREMENTS:
 When using user_input tool, you MUST ONLY ask for inputs that are VISIBLE on the screenshot:
@@ -878,10 +1510,49 @@ Example insights from history:
     : ""
 }
 
+🚨 **FINAL DECISION GUIDANCE - READ THIS BEFORE CHOOSING TOOL** 🚨
+
+**DECISION TREE FOR TOOL SELECTION:**
+
+1. **FIRST CHECK**: Are there risky actions visible in screenshot?
+   - YES → Use user_input to ask for confirmation FIRST
+   - NO → Continue to step 2
+
+2. **SECOND CHECK**: Did user just confirm risky actions?
+   - YES → Use actionables to record ALL elements (including confirmed risky ones)
+   - NO → Continue to step 3
+
+3. **THIRD CHECK**: Is this a new page or new elements appeared?
+   - YES → Use actionables to record ALL interactive elements
+   - NO → Continue to step 4
+
+4. **FOURTH CHECK**: Are you in login flow?
+   - YES → Use page_act for login-specific actions (fill forms, click login)
+   - NO → Continue to step 5
+
+5. **FIFTH CHECK**: Do you see loading indicators?
+   - YES → Use standby to wait for loading to complete
+   - NO → Continue to step 6
+
+6. **SIXTH CHECK**: Are there utility actions needed (cookies, popups)?
+   - YES → Use page_act for utility actions only
+   - NO → Continue to step 7
+
+7. **FINAL CHECK**: No new actionables and system is working on tree?
+   - YES → Use backtrack to let system continue
+   - NO → Use actionables to map any missed elements
+
+**ABSOLUTELY FORBIDDEN:**
+❌ Using page_act to manually execute actions you already listed in actionables
+❌ Using page_act for exploration when you should use actionables
+❌ Forgetting that actionables builds the tree and system executes automatically
+
+**REMEMBER**: Your job is to RECORD actions with actionables, not EXECUTE them with page_act
+
 Respond with ONLY valid JSON in this exact format:
 {
   "reasoning": "Your analysis of the current page and why you chose this tool",
-  "tool_to_use": "page_act|user_input|standby",
+  "tool_to_use": "page_act|user_input|standby|actionables|backtrack",
   "tool_parameters": {
     "instruction": "Specific instruction for the chosen tool",
     
@@ -1078,32 +1749,96 @@ This prevents URL changes from triggering queue behavior that would interrupt th
 - You should continue processing on the new page without setting isCurrentPageExecutionCompleted to true
 - The browser will remain on the post-login page for continued exploration
 
-${
-  isExplorationObjective
-    ? `
-EXPLORATION-SPECIFIC GUIDELINES:
-For page_act in exploration mode:
-✅ "Click the 'About' link"
-✅ "Click the 'Services' button"
-✅ "Click the 'Contact' link"
-✅ "Click the 'Accept' button on the cookie dialog"
-✅ "Click the dropdown to expand menu options"
+🚨 CRITICAL: EXPLORATION MODE - RESTRICTED page_act USAGE 🚨
 
-❌ "Click the About link and extract all information from that page"
-❌ "Navigate to About page and capture all content"
-❌ "Click About and get all policy information"
+In exploration mode, page_act should ONLY be used for:
 
-Remember: Each discovered page will be processed separately with its own extraction steps.
+✅ ALLOWED page_act USAGE:
+- Cookie consent buttons: "Click 'Accept' button on the cookie dialog"
+- Modal dismissals: "Click 'Close' button to dismiss the modal"  
+- Non-exploration utility actions: "Click 'Dismiss' on the notification banner"
+- Sensitive flows (login): "Type email into login field" (when isInSensitiveFlow=true)
+- Popup/overlay handling: "Click 'OK' on the popup message"
+- Language/region settings: "Select 'English' from language dropdown"
+- Age verification: "Click 'I am 18+' on age verification popup"
+- Terms acceptance: "Click 'I Agree' on terms and conditions popup"
+
+🚫 FORBIDDEN page_act USAGE IN EXPLORATION:
+- Navigation links: ❌ "Click the 'About' link"
+- Menu items: ❌ "Click the 'Services' button" 
+- Content exploration: ❌ "Click the 'Products' section"
+- Interactive elements for exploration: ❌ "Click the dropdown to see options"
+- Form interactions for exploration: ❌ "Click into the search field"
+- Any action that's part of exploring the website functionality
+- **ANY ELEMENT YOU ALREADY LISTED IN ACTIONABLES** ❌ "Click the 'Following OKRs' link" (if already in actionables)
+
+🚨 **CRITICAL: NEVER USE PAGE_ACT FOR ACTIONABLES YOU ALREADY PROVIDED** 🚨
+
+**FORBIDDEN REASONING PATTERNS:**
+❌ "I am continuing the systematic exploration of the left navigation menu"
+❌ "The next logical step is to click 'Following OKRs'"
+❌ "Based on the actionables I previously identified"
+❌ "I will now click on the next element from my list"
+
+**CORRECT UNDERSTANDING:**
+✅ Actionables tool = MAPPING phase (you identify what's available)
+✅ System execution = EXECUTION phase (system clicks everything automatically)
+✅ Your role = OBSERVE results and provide NEW actionables when page changes
+- **ANY ELEMENT YOU ALREADY LISTED IN ACTIONABLES** ❌ "Click the 'Following OKRs' link" (if already in actionables)
+
+🚨 **CRITICAL: NEVER USE PAGE_ACT FOR ACTIONABLES YOU ALREADY PROVIDED** 🚨
+
+**FORBIDDEN REASONING PATTERNS:**
+❌ "I am continuing the systematic exploration of the left navigation menu"
+❌ "The next logical step is to click 'Following OKRs'"
+❌ "Based on the actionables I previously identified"
+❌ "I will now click on the next element from my list"
+
+**CORRECT UNDERSTANDING:**
+✅ Actionables tool = MAPPING phase (you identify what's available)
+✅ System execution = EXECUTION phase (system clicks everything automatically)
+✅ Your role = OBSERVE results and provide NEW actionables when page changes
+
+🎯 USE ACTIONABLES TOOL INSTEAD:
+For exploration purposes, use the actionables tool to:
+- Map out all interactive elements
+- List navigation links, buttons, dropdowns, forms
+- Let the system handle execution automatically through tree traversal
+- Build comprehensive exploration tree structure
+
+CORRECT EXPLORATION APPROACH:
+❌ page_act: "Click the 'Services' link to explore services page"
+✅ actionables: Extract all interactive elements including Services link
+✅ System automatically executes the Services link via tree traversal
+
+❌ page_act: "Click the dropdown to see menu options"  
+✅ actionables: Extract dropdown as actionable element
+✅ System automatically expands dropdown when processing that actionable
+
+❌ page_act: "Click 'Following OKRs' based on my previous actionables list"
+✅ WAIT: System will automatically click 'Following OKRs' from the actionables you provided
+
+WHEN TO USE EACH TOOL IN EXPLORATION:
+- actionables: For mapping website functionality and exploration paths
+- backtrack: When finished with current exploration path  
+- page_act: ONLY for non-exploration utility actions (cookies, popups, etc.)
+- user_input: When user interaction is needed
+- standby: When page is loading
+
+Remember: The goal is to let actionables/backtrack handle the exploration flow while page_act handles only utility/maintenance actions that aren't part of the core exploration.
+
+**WORKFLOW UNDERSTANDING:**
+1. YOU: Provide actionables list with all interactive elements
+2. SYSTEM: Automatically executes each actionable in tree order
+3. YOU: Wait and observe - do NOT manually execute with page_act
+4. YOU: Only act when NEW elements appear or when using backtrack
 
 WHEN MAX PAGES REACHED IN EXPLORATION MODE:
-- Continue exploring the CURRENT page thoroughly
-- Use page_act for dialogs, forms, dropdowns, modals, etc.
+- Continue using actionables to map current page thoroughly
+- Use page_act ONLY for utility actions (cookies, popups, etc.)
 - Extract all possible information from current page
-- Do NOT worry about navigation links not being queued
-- Focus on maximizing value from available pages
-`
-    : ""
-}
+- Do NOT use page_act for exploration navigation
+- Focus on maximizing value through systematic actionables mapping
 
 You should:
 1. CAREFULLY ANALYZE THE SCREENSHOT - this is the most important step
@@ -1167,13 +1902,21 @@ Remember: Break down complex actions into simple steps. One action per step.`;
             ],
           },
         ],
+        experimental_telemetry: {
+          isEnabled: true,
+          recordOutputs: true,
+          functionId: langfuseTraceId,
+          metadata: {
+            llmDecision: true,
+            langfuseUpdateParent: false, // Do not update the parent trace with execution results
+          },
+        },
         schema: LLMDecisionResponseSchema,
       });
 
       const parsedResponse = response.object as LLMDecisionResponse;
       this.fileManager.saveLLMResponse(urlHash, stepNumber, "decision", {
         ...parsedResponse,
-        image: `data:image/png;base64,${base64Image}`,
       });
 
       return parsedResponse;
@@ -1342,14 +2085,213 @@ IMPORTANT:
   }
 
   /**
+   * Build tree exploration context for interaction graph generation
+   */
+  private buildTreeExplorationContext(
+    urlHash: string,
+    globalStoreInstance: any
+  ): string {
+    try {
+      // Get the tree data from GlobalStore
+      const treeNode = globalStoreInstance.trees?.get(urlHash);
+      const currentNodeId = globalStoreInstance.currentNodeId?.get(urlHash);
+
+      if (!treeNode) {
+        return `
+🌳 EXPLORATION TREE CONTEXT:
+No tree exploration data available for this page.
+`;
+      }
+
+      // Build context for completed nodes and their children
+      const completedNodesContext = this.buildCompletedNodesContext(
+        treeNode,
+        currentNodeId
+      );
+
+      return `
+🌳 EXPLORATION TREE CONTEXT:
+This website has been systematically explored using an actionables-based tree traversal system.
+The following shows the exploration progress and completed interactions:
+
+📊 TREE EXPLORATION PROGRESS:
+${completedNodesContext}
+
+🎯 CONTEXT SIGNIFICANCE:
+- Each completed node represents a successful interaction that was executed
+- The tree structure shows the logical flow of exploration decisions
+- This context helps understand the complete user journey beyond just screenshots
+- Actions are organized hierarchically based on discovery and execution order
+
+This tree exploration context provides additional insight into the systematic exploration process
+that complements the visual screenshot analysis for creating comprehensive interaction flows.
+`;
+    } catch (error) {
+      return `
+🌳 EXPLORATION TREE CONTEXT:
+Error accessing tree exploration data: ${error instanceof Error ? error.message : "Unknown error"}
+`;
+    }
+  }
+
+  /**
+   * Build context for completed nodes and their children
+   */
+  private buildCompletedNodesContext(
+    node: any,
+    currentNodeId: string,
+    depth: number = 0
+  ): string {
+    const indent = "  ".repeat(depth);
+    const isCurrent = node.id === currentNodeId ? " ← CURRENT" : "";
+    const completedMark = node.completed ? "✅" : "⏳";
+
+    let context = "";
+
+    // Only include completed nodes or nodes with at least one completed child
+    const hasCompletedChild = this.hasCompletedChild(node);
+
+    if (node.completed || hasCompletedChild) {
+      const actionTypeIcon = this.getActionTypeIcon(node.actionType);
+      context += `${indent}${completedMark} ${actionTypeIcon} [${node.id}] ${node.action}${isCurrent}\n`;
+
+      // Recursively add children
+      for (const child of node.children || []) {
+        context += this.buildCompletedNodesContext(
+          child,
+          currentNodeId,
+          depth + 1
+        );
+      }
+    }
+
+    return context;
+  }
+
+  /**
+   * Check if a node has at least one completed child
+   */
+  private hasCompletedChild(node: any): boolean {
+    if (!node.children || node.children.length === 0) {
+      return false;
+    }
+
+    for (const child of node.children) {
+      if (child.completed || this.hasCompletedChild(child)) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  /**
+   * Get action type icon for display
+   */
+  private getActionTypeIcon(actionType: string): string {
+    switch (actionType) {
+      case "click":
+        return "🖱️";
+      case "hover":
+        return "👆";
+      case "scroll":
+        return "📜";
+      case "nothing":
+        return "🏠";
+      default:
+        return "❓";
+    }
+  }
+
+  /**
    * Generate image-based flow interaction graph using Claude
    */
   async generateInteractionGraph(
+    langfuseTraceId: string,
     globalStore: PageStore,
-    currentGraph: InteractionGraph | undefined
+    currentGraph: InteractionGraph | undefined,
+    globalStoreInstance?: any
   ): Promise<InteractionGraph | null> {
     try {
+      // Get tree exploration context if GlobalStore instance is provided
+      const treeContext = globalStoreInstance
+        ? this.buildTreeExplorationContext(
+            globalStore.urlHash,
+            globalStoreInstance
+          )
+        : "";
+
       const systemPrompt = `You are a flow expert creating picture stories of website interactions. Each picture shows what the user sees on their screen.
+
+🚨 CRITICAL BRANCHING ENFORCEMENT - TREE STRUCTURE DICTATES FLOW STRUCTURE 🚨
+
+**MANDATORY RULE: IF A TREE NODE HAS CHILDREN → MUST CREATE BRANCHING FLOWS**
+
+When you see tree exploration context showing nodes with children:
+- Parent node = branching point in flow
+- Each child = separate branch from parent
+- NEVER create linear flows when children exist
+- ALWAYS create branching flows that respect tree structure
+
+**FORBIDDEN PATTERNS:**
+❌ Linear flows when tree shows children: Parent → Child1 → Child2 → Child3
+❌ Single-screenshot flows with no meaningful progression
+❌ "Revert" edges like "go_back", "return_to_previous", "navigate_back"
+
+**REQUIRED PATTERNS:**
+✅ Branching flows when children exist: Parent → Child1, Parent → Child2, Parent → Child3
+✅ Circular flows for return journeys: Action → Complete → Return to Start
+✅ Meaningful flows with 2+ screenshots showing actual progression
+
+🚨 CRITICAL FLOW STATE RESTRICTIONS 🚨
+
+**ABSOLUTELY FORBIDDEN FLOW STATES:**
+❌ NEVER create flow states like "reopen", "reset", "restart", "refresh", "reload"
+❌ NEVER create circular flows that loop back to create infinite cycles
+❌ NEVER add flow states that represent system operations or page refreshes
+❌ NEVER create flows for repetitive actions that don't add meaningful progression
+
+**FLOW STATE RULES:**
+✅ Only create flows for meaningful user interactions that change the visual state
+✅ Focus on actual user goals and task completion flows
+✅ Each flow should represent a complete user journey with clear start and end points
+✅ Avoid technical system states that don't represent user actions
+
+🚨 CRITICAL INSTRUCTION DEDUPLICATION 🚨
+
+**MANDATORY INSTRUCTION ANALYSIS:**
+Before creating separate flows, you MUST analyze if different instructions have the same semantic meaning.
+
+**INSTRUCTION DEDUPLICATION RULES:**
+✅ If two instructions have the same semantic meaning, create ONLY ONE flow
+✅ Merge similar instructions that achieve the same goal
+✅ Focus on the actual action being performed, not the exact wording
+
+**EXAMPLES OF INSTRUCTIONS THAT SHOULD BE MERGED:**
+
+Example 1 - These are SEMANTICALLY IDENTICAL:
+- "Click on the '+ Create a new canvas' button."
+- "I am currently on a page where these actions have already been performed: [Click on the '+ Create a new canvas' button.]. Now I need to continue the sequence by performing: Click on the '+ Create a new canvas' button."
+
+RESULT: Create only ONE flow node for this action, not two separate branches.
+
+Example 2 - These are SEMANTICALLY IDENTICAL:
+- "Click the login button"
+- "Click the login button to proceed with authentication"
+- "Click on the login button to submit credentials"
+
+RESULT: Create only ONE flow node for this action, not multiple branches.
+
+**SEMANTIC ANALYSIS PROCESS:**
+1. Extract the core action from each instruction (ignore context and explanations)
+2. Identify if the core action is the same across different instructions
+3. If core actions are identical, merge them into a single flow node
+4. Use the clearest, most concise instruction text for the merged node
+
+**FORBIDDEN BRANCHING PATTERNS:**
+❌ Creating multiple branches for the same semantic action
+❌ Splitting flows based on instruction wording differences
+❌ Creating separate paths for identical user interactions
 
 🚨 CRITICAL OUTPUT FORMAT REQUIREMENT:
 You MUST respond with ONLY a valid JSON object. NO extra words, NO explanations, NO markdown formatting, NO backticks, NO comments outside the JSON.
@@ -1364,16 +2306,35 @@ Your response must be EXACTLY this format:
   "lastUpdated": "2024-01-01T12:00:00.000Z"
 }
 
+${treeContext}
+
+🚨 **CRITICAL WARNING: TREE CONTEXT IS FOR FLOW STRUCTURE ONLY** 🚨
+
+THE TREE CONTEXT ABOVE IS ONLY TO SHOW YOU:
+- How to create branching vs linear flows
+- Which actions are related to each other
+- The hierarchical structure of user interactions
+
+THE TREE CONTEXT DOES NOT CONTAIN:
+❌ Real imageNames (use action data below instead)
+❌ Real step numbers (use action data below instead) 
+❌ Real node IDs (use action data below instead)
+
+**YOU MUST GET ALL IDs, imageNames, AND stepNumbers FROM THE ACTION SEQUENCE DATA BELOW, NOT FROM THE TREE CONTEXT.**
+
 📋 DETAILED JSON STRUCTURE REQUIREMENTS:
 
 NODES ARRAY - Each node represents a visual state/screenshot.
 🚨 EVERY FIELD MARKED AS REQUIRED MUST BE PRESENT. NO EXCEPTIONS!
 
+🚨 CRITICAL: ID AND IMAGENAME MUST COME FROM ACTION DATA 🚨
+DO NOT INVENT THESE VALUES. USE EXACT VALUES FROM THE ACTION SEQUENCE ABOVE.
+
 {
-  "id": "step_0_initial", // ⚠️ REQUIRED: Unique identifier for the image
-  "stepNumber": 0, // ⚠️ REQUIRED: Step number from action history (must be number, not string)
-  "instruction": "Initial page load", // ⚠️ REQUIRED: What action led to this state (must be string)
-  "imageName": "step_0_initial", // ⚠️ REQUIRED: Image filename/identifier (must match id exactly)
+  "id": "step_0_initial", // ⚠️ REQUIRED: MUST BE EXACT imageName FROM ACTION DATA
+  "stepNumber": 0, // ⚠️ REQUIRED: MUST BE EXACT stepNumber FROM ACTION DATA (number, not string)
+  "instruction": "Initial page load", // ⚠️ REQUIRED: MUST BE EXACT instruction FROM ACTION DATA
+  "imageName": "step_0_initial", // ⚠️ REQUIRED: MUST BE EXACT imageName FROM ACTION DATA (must match id exactly)
   "imageData": "PLACEHOLDER_WILL_BE_REPLACED", // ⚠️ REQUIRED: Use this exact string, will be replaced automatically
   "metadata": { // ⚠️ REQUIRED: Complete metadata object - ALL sub-fields required
     "visibleElements": ["Login form", "Email input"], // ⚠️ REQUIRED: Array of UI elements visible (can be empty array [])
@@ -1756,6 +2717,27 @@ PAGE DATA ANALYSIS:
 - Total Actions Performed: ${globalStore.actionHistory.length}
 - Initial Screenshot: Available as baseline state
 
+🚨 CRITICAL: ID AND IMAGENAME DERIVATION RULES 🚨
+
+**MANDATORY RULE: DERIVE ALL IDs AND imageNames FROM ACTION DATA ONLY**
+
+YOU MUST STRICTLY USE THE EXACT imageNames FROM THE ACTION DATA BELOW.
+DO NOT CREATE YOUR OWN IDs OR imageNames.
+DO NOT USE TREE STRUCTURE DATA FOR NAMING.
+THE ACTION DATA IS THE SINGLE SOURCE OF TRUTH FOR ALL NAMING.
+
+**FORBIDDEN:**
+❌ Creating your own imageNames like "homepage_view" or "login_screen"
+❌ Using tree structure data for naming nodes
+❌ Inventing new step numbers or image identifiers
+❌ Modifying the imageName values provided in the action data
+
+**REQUIRED:**
+✅ Use EXACT imageName from action data: "${globalStore.actionHistory[0]?.imageName || "step_0_initial"}"
+✅ Use EXACT stepNumber from action data: ${globalStore.actionHistory[0]?.stepNumber || 0}
+✅ Use EXACT instruction from action data: "${globalStore.actionHistory[0]?.instruction || "Initial page load"}"
+✅ Node id MUST MATCH imageName EXACTLY
+
 ACTION SEQUENCE TO ANALYZE:
 ${globalStore.actionHistory
   .map(
@@ -1763,6 +2745,7 @@ ${globalStore.actionHistory
 ${index + 1}. Action: "${action.instruction}" 
    -> Results in State: ${action.imageName}
    Step: ${action.stepNumber} | Time: ${action.timestamp}
+   🚨 MUST USE: id="${action.imageName}", imageName="${action.imageName}", stepNumber=${action.stepNumber}
 `
   )
   .join("")}
@@ -1830,6 +2813,13 @@ CRITICAL PRESERVATION REMINDER:
 - Initial image MUST be named "step_0_initial"
 - Only create edges when screenshots show actual visual changes
 
+🚨 FINAL REMINDER: USE EXACT ACTION DATA FOR ALL NAMING 🚨
+- Node IDs = EXACT imageName from action data
+- Node imageNames = EXACT imageName from action data  
+- Node stepNumbers = EXACT stepNumber from action data
+- Node instructions = EXACT instruction from action data
+- DO NOT INVENT OR MODIFY THESE VALUES
+
 COMPLETE ANALYSIS INSTRUCTIONS:
 1. ANALYZE EVERY SCREENSHOT in the conversation history
 2. CHECK ALL ACTIONS performed during exploration
@@ -1865,6 +2855,15 @@ Remember: Compare each before/after image pair carefully. If the UI looks identi
         system: systemPrompt,
         maxTokens: 60000, // Increased for comprehensive analysis
         messages: interleavedMessages,
+        experimental_telemetry: {
+          isEnabled: true,
+          recordOutputs: true,
+          functionId: langfuseTraceId,
+          metadata: {
+            graphGeneration: true,
+            langfuseUpdateParent: false, // Do not update the parent trace with execution results
+          },
+        },
       });
 
       // Store raw response first with versioning
@@ -2099,19 +3098,161 @@ Remember: Compare each before/after image pair carefully. If the UI looks identi
   private readonly flowNamingGuidelines = `
 🎯 FLOW NAMING EXCELLENCE GUIDE:
 
-1. ANALYZE VISUAL CONTENT IN IMAGES:
+🚨 CRITICAL BRANCHING RULES - ZERO TOLERANCE FOR LINEAR FLOWS WITH CHILDREN 🚨
+
+1. **MANDATORY BRANCHING DETECTION**:
+If a tree node has children, it MUST create branching flows - NEVER linear flows!
+
+✅ CORRECT BRANCHING PATTERN:
+\`\`\`
+Homepage (has children: About, Contact, Products)
+├── About Page (branch 1)
+├── Contact Page (branch 2) 
+└── Products Page (branch 3)
+\`\`\`
+
+FLOW STRUCTURE:
+- Flow: "Site Navigation Options" (flowType: "branching")
+- Homepage → About Page
+- Homepage → Contact Page  
+- Homepage → Products Page
+
+❌ ABSOLUTELY FORBIDDEN LINEAR PATTERN:
+\`\`\`
+Homepage → About → Contact → Products (WRONG!)
+\`\`\`
+
+2. **CHILDREN DETECTION RULE**:
+When analyzing tree exploration context, if you see:
+- "Node has children: [action1, action2, action3]"
+- Multiple actionables from same parent
+- Multiple options available from same state
+
+→ MANDATORY: Create BRANCHING flows, NOT linear flows!
+
+3. **SENSIBLE FLOW CREATION - NO SINGLE SCREENSHOTS**:
+🚫 FORBIDDEN: Creating flows with only one screenshot
+🚫 FORBIDDEN: "no_act" flows with single images
+🚫 FORBIDDEN: Dead-end flows that don't lead anywhere
+
+✅ REQUIRED: Every flow must have meaningful progression:
+- Minimum 2 screenshots showing actual interaction
+- Clear user journey from start to meaningful end
+- Actual state changes between screenshots
+
+4. **CIRCULAR FLOW ENFORCEMENT**:
+🚫 ABSOLUTELY FORBIDDEN: Creating "revert" or "back" edges
+🚫 FORBIDDEN EDGE NAMES: "revert_act", "go_back", "return_to_previous"
+
+✅ REQUIRED: Create CIRCULAR flows instead:
+\`\`\`
+Dashboard → Settings → Save Changes → Dashboard (circular)
+Homepage → Product Details → Add to Cart → Homepage (circular)
+\`\`\`
+
+5. **SMART FLOW PATTERNS**:
+
+**BRANCHING FLOWS** (when children exist):
+- Navigation menus with multiple options
+- Filter/sort options from same starting point
+- Tab switching interfaces
+- Action buttons available simultaneously
+
+**CIRCULAR FLOWS** (for return journeys):
+- Settings → Change → Save → Return to main
+- Product → Cart → Checkout → Confirmation → Home
+- Login → Dashboard → Logout → Login
+
+**LINEAR FLOWS** (ONLY when no children/alternatives):
+- Multi-step forms (step 1 → step 2 → step 3)
+- Wizard interfaces with required sequence
+- Authentication flows with required steps
+
+6. **TREE STRUCTURE ANALYSIS**:
+When you see tree context like:
+\`\`\`
+🌳 Node: "Click About link" 
+   ├── Child: "Click Contact info"
+   ├── Child: "Click Team page"
+   └── Child: "Click History section"
+\`\`\`
+
+MANDATORY RESPONSE: Create branching flow from About page to all children!
+
+7. **FLOW NAMING REQUIREMENTS**:
+✅ "Site Navigation and Content Discovery" (branching)
+✅ "Product Filtering and Sorting Options" (branching)
+✅ "Dashboard Widget Configuration" (branching)
+✅ "User Account Management Flows" (circular)
+✅ "Content Creation and Publishing Pipeline" (linear - only if no alternatives)
+
+8. **EDGE CREATION RULES**:
+🚫 NEVER create edges like:
+- "revert_to_homepage"
+- "navigate_back" 
+- "return_to_previous_state"
+
+✅ ALWAYS create meaningful edges:
+- "complete_task_return_to_dashboard"
+- "save_settings_redirect_to_main"
+- "finish_workflow_show_homepage"
+
+9. **QUALITY CONTROL CHECKLIST**:
+Before creating any flow, verify:
+- [ ] Does this node have children? → Must be branching
+- [ ] Are there multiple options from same state? → Must be branching  
+- [ ] Is this a return journey? → Must be circular
+- [ ] Does this flow have meaningful progression? → Must have 2+ screenshots
+- [ ] Am I creating "revert" edges? → Forbidden, use circular instead
+
+10. **TREE EXPLORATION CONTEXT INTEGRATION**:
+When you see incomplete nodes or children in tree context:
+- Each child action = separate branch in flow
+- Parent node = branching point
+- Completed children = branches that were explored
+- Incomplete children = branches that exist but weren't taken
+
+EXAMPLE TREE → FLOW CONVERSION:
+\`\`\`
+Tree Context:
+Homepage (completed)
+├── About Page (completed)
+│   ├── Team Section (completed)
+│   └── History Section (incomplete)
+├── Contact Page (completed)
+└── Products Page (incomplete)
+
+Required Flows:
+1. "Site Navigation" (branching):
+   - Homepage → About Page
+   - Homepage → Contact Page
+   - Homepage → Products Page
+
+2. "About Page Exploration" (branching):
+   - About Page → Team Section
+   - About Page → History Section
+\`\`\`
+
+🚨 FINAL ENFORCEMENT:
+- IF tree has children → MUST create branching flows
+- NO single-screenshot flows allowed
+- NO "revert" edges allowed - use circular flows
+- Every flow must show meaningful user journey
+- Tree structure DICTATES flow structure - follow it exactly!
+
+11. **ANALYZE VISUAL CONTENT IN IMAGES**:
 - Look at the actual UI elements and content shown
 - Understand the user's goal from the visual context
 - Consider the application domain and purpose
 
-2. CREATE DESCRIPTIVE FLOW NAMES:
+12. **CREATE DESCRIPTIVE FLOW NAMES**:
 ✅ "Product Image Upload and Gallery Management"
 ✅ "Multi-step User Registration with Email Verification"
 ✅ "Advanced Search Configuration and Results Filtering"
 ✅ "Team Member Invitation and Role Assignment"
 ✅ "Project Settings and Collaboration Setup"
 
-3. EDGE NAMING BEST PRACTICES:
+13. **EDGE NAMING BEST PRACTICES**:
 - Describe the EXACT action and its impact
 - Include visual feedback or state changes
 - Reference specific UI elements clicked
@@ -2123,7 +3264,7 @@ Examples:
 ✅ "Toggle 'Dark Mode' switch to change theme"
 ✅ "Click 'Next' to proceed to payment details"
 
-4. FLOW CATEGORIZATION:
+14. **FLOW CATEGORIZATION**:
 🔐 Authentication Flows:
 - "Complete User Authentication with 2FA"
 - "Password Reset and Account Recovery"
@@ -2144,7 +3285,7 @@ Examples:
 - "Advanced Search with Filters and Sorting"
 - "Content Discovery and Recommendations"
 
-5. EDGE DETAIL REQUIREMENTS:
+15. **EDGE DETAIL REQUIREMENTS**:
 Must include:
 - Specific element interacted with
 - Visual feedback or state change
@@ -2155,7 +3296,7 @@ Example:
 "Select 'Project Type' dropdown → Reveals template options with preview cards"
 "Submit search form → Displays filtered results with matching highlights"
 
-6. VISUAL ANALYSIS FOR NAMING:
+16. **VISUAL ANALYSIS FOR NAMING**:
 Look for:
 - Modal dialogs and their purpose
 - Form fields and their grouping
@@ -2166,7 +3307,7 @@ Look for:
 - Loading indicators
 - Success/error messages
 
-7. DOMAIN-SPECIFIC NAMING:
+17. **DOMAIN-SPECIFIC NAMING**:
 E-commerce:
 - "Product Catalog Browsing and Filtering"
 - "Shopping Cart Management and Checkout"
@@ -2179,7 +3320,7 @@ Content Platform:
 - "Content Upload and Publishing Pipeline"
 - "Media Asset Management and Organization"
 
-8. USER GOAL ORIENTATION:
+18. **USER GOAL ORIENTATION**:
 Always name based on what the user is trying to achieve:
 ✅ "Create New Project from Template"
 ✅ "Configure Automated Email Notifications"
@@ -2189,26 +3330,104 @@ Always name based on what the user is trying to achieve:
   private readonly edgeNamingGuidelines = `
 🎯 EDGE NAMING EXCELLENCE GUIDE:
 
-1. STRUCTURE: [Action] → [Result] → [Purpose]
+🚨 CRITICAL EDGE CREATION RULES - ENFORCE CIRCULAR FLOWS 🚨
+
+1. **ABSOLUTELY FORBIDDEN EDGE TYPES**:
+🚫 NEVER create edges with these patterns:
+- "revert_act", "revert_to_*", "go_back", "navigate_back"
+- "return_to_previous", "back_to_homepage", "return_to_main"
+- "undo_action", "reverse_flow", "step_back"
+- Any edge that suggests "reverting" or "going backwards"
+
+2. **MANDATORY CIRCULAR FLOW PATTERNS**:
+✅ ALWAYS create meaningful circular flows instead:
+- "complete_settings_return_to_dashboard"
+- "finish_task_redirect_to_main_page"
+- "save_changes_navigate_to_overview"
+- "submit_form_show_confirmation_then_home"
+
+3. **STRUCTURE: [Action] → [Result] → [Purpose]**:
 Example: "Click 'Upload' → Opens file dialog → For adding profile picture"
 
-2. VISUAL FEEDBACK:
+4. **VISUAL FEEDBACK REQUIREMENTS**:
 Include state changes:
 ✅ "Click 'Save' → Button shows loading spinner → Settings updated"
 ✅ "Toggle switch → Background changes to green → Feature enabled"
+✅ "Submit form → Success message appears → Task completed"
 
-3. ELEMENT SPECIFICITY:
+5. **ELEMENT SPECIFICITY**:
 Reference exact UI:
 ✅ "Click blue 'Continue' button in top-right"
 ✅ "Select 'High Priority' from status dropdown"
+✅ "Click 'Create Project' button in navigation bar"
 
-4. CONTEXT AWARENESS:
+6. **CONTEXT AWARENESS**:
 Show relationship to flow:
 ✅ "Enter project name → Creates new workspace → Starts project setup"
 ✅ "Click 'Add Member' → Opens invitation form → For team expansion"
+✅ "Select filter option → Updates results view → Shows filtered content"
 
-5. USER INTENTION:
+7. **USER INTENTION CLARITY**:
 Clarify purpose:
 ✅ "Click filter icon → Shows advanced search → To refine results"
-✅ "Select date range → Updates timeline → To view specific period"`;
+✅ "Select date range → Updates timeline → To view specific period"
+✅ "Click 'Publish' → Article goes live → Content becomes public"
+
+8. **BRANCHING EDGE PATTERNS**:
+When creating edges from nodes with children:
+✅ "Click 'Products' menu → Shows product categories → Navigate to catalog"
+✅ "Click 'Settings' → Opens configuration panel → Access preferences"
+✅ "Click 'Dashboard' → Shows main interface → Return to overview"
+
+9. **CIRCULAR COMPLETION PATTERNS**:
+For return journeys, use meaningful descriptions:
+✅ "Complete workflow → Show success message → Return to main dashboard"
+✅ "Finish configuration → Save settings → Navigate back to home"
+✅ "Submit application → Display confirmation → Redirect to portal"
+
+10. **QUALITY CONTROL FOR EDGES**:
+Before creating any edge, verify:
+- [ ] Does this edge show actual visual change between screenshots?
+- [ ] Am I avoiding "revert" or "back" language?
+- [ ] Does this edge describe a meaningful user action?
+- [ ] Is this part of a sensible flow (branching/circular/linear)?
+- [ ] Does the edge name match the visual transition shown?
+
+11. **FORBIDDEN vs CORRECT EXAMPLES**:
+
+❌ FORBIDDEN:
+- "revert_to_homepage"
+- "go_back_to_main"
+- "return_to_previous_state"
+- "navigate_back_to_dashboard"
+
+✅ CORRECT ALTERNATIVES:
+- "complete_task_return_to_homepage"
+- "finish_workflow_show_main_interface"
+- "save_changes_redirect_to_overview"
+- "submit_form_navigate_to_dashboard"
+
+12. **EDGE NAMING FOR DIFFERENT FLOW TYPES**:
+
+**BRANCHING FLOW EDGES**:
+- "Select navigation option → Load target page → Access specific content"
+- "Choose filter criteria → Update view → Show filtered results"
+- "Click action button → Trigger functionality → Execute user intent"
+
+**CIRCULAR FLOW EDGES**:
+- "Complete process → Show confirmation → Return to starting point"
+- "Finish configuration → Save settings → Navigate to main view"
+- "Submit data → Display success → Redirect to overview"
+
+**LINEAR FLOW EDGES** (rare, only when no alternatives):
+- "Click 'Next' → Advance to step 2 → Continue form process"
+- "Enter credentials → Validate login → Proceed to dashboard"
+- "Upload file → Process content → Show preview"
+
+🚨 FINAL EDGE ENFORCEMENT:
+- NO "revert" edges allowed - use circular flows
+- Every edge must show meaningful progression
+- Edge names must match visual transitions
+- Describe actual user actions and their outcomes
+- Support the overall flow structure (branching/circular/linear)`;
 }
